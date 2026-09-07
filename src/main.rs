@@ -4,6 +4,7 @@ mod error;
 mod idmap;
 mod init;
 mod mount;
+mod net;
 mod ns;
 mod syscall;
 
@@ -16,6 +17,8 @@ use crate::container::RunSpec;
 use crate::error::{Context, Error, Result};
 use crate::idmap::Identity;
 use crate::init::InitSpec;
+use crate::net::NetworkMode;
+use crate::net::veth::{self, Endpoint};
 use crate::ns::Namespaces;
 
 #[derive(Parser)]
@@ -58,6 +61,10 @@ struct RunArgs {
     #[arg(long, value_name = "N")]
     pids: Option<u64>,
 
+    /// Networking: an empty namespace, or a veth onto the quilt0 bridge.
+    #[arg(long, value_enum, default_value_t = NetworkMode::None)]
+    net: NetworkMode,
+
     /// The command to run, and its arguments.
     #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
     command: Vec<String>,
@@ -73,6 +80,12 @@ struct InitArgs {
 
     #[arg(long = "ro", value_name = "SRC:DST")]
     readonly: Vec<String>,
+
+    #[arg(long, value_name = "ADDRESS/PREFIX", requires = "net_gateway")]
+    net_address: Option<String>,
+
+    #[arg(long, value_name = "ADDRESS", requires = "net_address")]
+    net_gateway: Option<String>,
 
     #[arg(trailing_var_arg = true, num_args = 1..)]
     command: Vec<String>,
@@ -102,6 +115,10 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     .map(|v| init::parse_bind(v))
                     .collect::<Result<Vec<_>>>()?,
                 argv: args.command,
+                network: match (&args.net_address, &args.net_gateway) {
+                    (Some(address), Some(gateway)) => Some(Endpoint::parse(address, gateway)?),
+                    _ => None,
+                },
             })?;
             unreachable!("init::exec only returns an error")
         }
@@ -133,8 +150,21 @@ fn run(args: RunArgs) -> Result<i32> {
         cgroup::cpu_max(cpus)?;
     }
 
-    let spec =
-        RunSpec { rootfs, hostname: args.hostname, readonly_binds, argv: args.command, limits };
+    // The runtime's own pid is unique among the containers running at any one
+    // time, which is all the address and interface name need.
+    let network = match args.net {
+        NetworkMode::None => None,
+        NetworkMode::Bridge => Some(veth::Plan::new(std::process::id())),
+    };
+
+    let spec = RunSpec {
+        rootfs,
+        hostname: args.hostname,
+        readonly_binds,
+        argv: args.command,
+        limits,
+        network,
+    };
 
     // One scope per invocation. Phase 4 takes the id from the OCI caller.
     let driver = RootCgroup::new(cgroup::run_id());
@@ -205,6 +235,26 @@ mod tests {
             Cli::try_parse_from(["quilt", "run", "./rootfs", "/bin/sh", "-c", "ps aux"]).unwrap();
         let Command::Run(args) = cli.command else { panic!("expected run") };
         assert_eq!(args.command, ["/bin/sh", "-c", "ps aux"]);
+    }
+
+    #[test]
+    fn networking_is_off_unless_asked_for() {
+        let cli = Cli::try_parse_from(["quilt", "run", "./rootfs", "/bin/sh"]).unwrap();
+        let Command::Run(args) = cli.command else { panic!("expected run") };
+        assert_eq!(args.net, NetworkMode::None);
+    }
+
+    #[test]
+    fn cli_accepts_bridge_networking() {
+        let cli =
+            Cli::try_parse_from(["quilt", "run", "--net", "bridge", "./rootfs", "/bin/sh"]).unwrap();
+        let Command::Run(args) = cli.command else { panic!("expected run") };
+        assert_eq!(args.net, NetworkMode::Bridge);
+    }
+
+    #[test]
+    fn cli_rejects_an_unknown_network_mode() {
+        assert!(Cli::try_parse_from(["quilt", "run", "--net", "macvlan", "./rootfs", "sh"]).is_err());
     }
 
     #[test]

@@ -14,6 +14,7 @@ use crate::cgroup::{CgroupDriver, Limits, Scope};
 use crate::error::{Context, Error, Result};
 use crate::idmap::IdMapper;
 use crate::mount::BindSpec;
+use crate::net::veth;
 use crate::ns::{self, CloneArgs, Fork, Namespaces};
 
 pub struct RunSpec {
@@ -24,6 +25,8 @@ pub struct RunSpec {
     /// The workload and its arguments.
     pub argv: Vec<String>,
     pub limits: Limits,
+    /// `None` is `--net none`: a network namespace with only loopback in it.
+    pub network: Option<veth::Plan>,
 }
 
 /// Exit code used when the init process could not be reached or execed. 127 is
@@ -91,6 +94,21 @@ pub fn run(
                 kill_and_reap(child);
                 return Err(e);
             }
+
+            // The host side needs the child's pid to name its netns, so it can
+            // only happen now, and it must finish before the child is released:
+            // init configures the container end and the veth has to be there.
+            // `HostLink` deletes the pair on the way out of this scope.
+            let _link = match &spec.network {
+                Some(plan) => match veth::connect(plan, child) {
+                    Ok(link) => Some(link),
+                    Err(e) => {
+                        kill_and_reap(child);
+                        return Err(e);
+                    }
+                },
+                None => None,
+            };
             if let Err(e) = rustix::io::write(&map_done, &[1u8])
                 .context(|| "releasing the init process".to_string())
             {
@@ -120,6 +138,12 @@ fn init_argv(spec: &RunSpec) -> Vec<String> {
     for bind in &spec.readonly_binds {
         argv.push("--ro".to_string());
         argv.push(format!("{}:{}", bind.source.display(), bind.destination.display()));
+    }
+    if let Some(plan) = &spec.network {
+        argv.push("--net-address".to_string());
+        argv.push(format!("{}/{}", plan.endpoint.address, plan.endpoint.prefix_len));
+        argv.push("--net-gateway".to_string());
+        argv.push(plan.endpoint.gateway.to_string());
     }
     argv.push("--".to_string());
     argv.extend(spec.argv.iter().cloned());
@@ -232,6 +256,7 @@ mod tests {
             }],
             argv: vec!["/bin/sh".into(), "-c".into(), "echo hi".into()],
             limits: Limits::default(),
+            network: None,
         }
     }
 
@@ -249,6 +274,23 @@ mod tests {
         assert!(argv.windows(2).any(|w| w == ["--rootfs", "/srv/rootfs"]));
         assert!(argv.windows(2).any(|w| w == ["--hostname", "quilt"]));
         assert!(argv.windows(2).any(|w| w == ["--ro", "/etc/hosts:/etc/hosts"]));
+    }
+
+    #[test]
+    fn init_argv_carries_the_network_plan_when_there_is_one() {
+        let mut spec = spec();
+        spec.network = Some(veth::Plan::new(7));
+        let argv = init_argv(&spec);
+
+        let address = argv.iter().position(|a| a == "--net-address").unwrap();
+        assert_eq!(argv[address + 1], "10.88.0.9/16");
+        assert!(argv.windows(2).any(|w| w == ["--net-gateway", "10.88.0.1"]));
+    }
+
+    #[test]
+    fn init_argv_says_nothing_about_the_network_when_there_is_none() {
+        let argv = init_argv(&spec());
+        assert!(!argv.iter().any(|a| a.starts_with("--net")));
     }
 
     #[test]

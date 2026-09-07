@@ -10,12 +10,14 @@ use std::path::PathBuf;
 
 use crate::error::{Context, Error, Result};
 use crate::mount::{BindSpec, MountStrategy, StandardMounts};
+use crate::net::veth::{self, Endpoint};
 
 pub struct InitSpec {
     pub rootfs: PathBuf,
     pub hostname: String,
     pub readonly_binds: Vec<BindSpec>,
     pub argv: Vec<String>,
+    pub network: Option<Endpoint>,
 }
 
 /// Sets the container up and becomes the workload. Only returns on failure.
@@ -24,6 +26,13 @@ pub fn exec(spec: InitSpec) -> Result<std::convert::Infallible> {
         .context(|| format!("setting hostname to {:?}", spec.hostname))?;
 
     StandardMounts::new(spec.readonly_binds).prepare(&spec.rootfs)?.apply()?;
+
+    // After the mount plan, because the interface index comes out of sysfs and
+    // sysfs is mounted by that plan. It is the container's own sysfs, so it
+    // shows the container's netns.
+    if let Some(endpoint) = &spec.network {
+        veth::configure(endpoint)?;
+    }
 
     let (program, argv, envp) = workload(&spec.argv)?;
     let argv_ptrs = pointer_array(&argv);

@@ -68,6 +68,7 @@ src/
   seccomp.rs        classic-BPF assembler + default policy
   caps.rs           bounding set, no_new_privs
   net/
+    mod.rs          the --net modes
     netlink.rs      hand-rolled rtnetlink message encoder    (phase 3)
     veth.rs         veth pair, bridge, address assignment    (phase 3)
 ```
@@ -170,13 +171,43 @@ pid 1 and when the container never started.
 Out of the OCI path on purpose — this hangs off the bespoke CLI only.
 
 - A rtnetlink message encoder written against `RTM_NEWLINK` etc., with nested
-  attribute support (`IFLA_LINKINFO` → `IFLA_INFO_KIND`)
-- veth pair, one end moved into the container netns by pid
-- Host bridge, address assignment, default route
-- Masquerade rule for egress
+  attribute support. The veth request is the deepest nest and the reason the
+  encoder has to be general: `IFLA_LINKINFO` holds `IFLA_INFO_KIND` and
+  `IFLA_INFO_DATA`, and `IFLA_INFO_DATA` holds `VETH_INFO_PEER`, which is a
+  whole second `ifinfomsg` with its own attributes
+- veth pair, the peer moved into the container netns by pid. `IFLA_NET_NS_PID`
+  goes inside `VETH_INFO_PEER`, so the far end is born in the container's netns
+  rather than created on the host and moved afterwards. It is therefore never
+  visible on the host and cannot collide with a host interface already called
+  `eth0`
+- Host bridge, address assignment, default route. The address ordering is
+  load-bearing: the default route needs the connected prefix, which only appears
+  once the link is up
+- Interface indices come from `/sys/class/net/<name>/ifindex` rather than an
+  `RTM_GETLINK` round trip. The phase is about what goes out on the wire, and a
+  reply parser is a second job
+- Address allocation is seeded from the runtime's own pid, which is unique among
+  the containers running at one time. That is all a bridge with a handful of
+  containers needs; real IPAM belongs to podman, which is why networking is out
+  of the OCI path in the first place
+- Masquerade rule for egress, applied through `nft`. nf_tables netlink is a
+  second encoder as large as this whole phase and it teaches the same lesson
+  twice, so this takes the same bargain phase 6 takes with `newuidmap`: shell
+  out to the tool that owns the interface
 
 **Accepts when:** the encoder's output is byte-identical to what `ip link add`
-puts on the wire (captured with `nlmon`), and the container reaches the internet.
+puts on the wire (captured with `nlmon` by `scripts/capture-netlink.sh`, stored
+under `tests/golden/`, compared with the sequence number and port id zeroed
+since those are per-socket bookkeeping rather than part of the request), and the
+container reaches the internet.
+
+The bridge and the nftables table outlive containers on purpose — they are
+shared fabric, and tearing them down would cut off whatever else is still
+attached. So does `net.ipv4.ip_forward`, which is host-wide: by the time a
+container exits, something else may be relying on it. A one-shot runtime should
+not change a machine-wide kernel setting silently, so quilt says on stderr when
+it is the one turning it on. The veth is the only part torn down per container:
+deleting the host end takes the peer with it, on every path out.
 
 ### Phase 4 — OCI runtime spec
 
@@ -236,7 +267,10 @@ reference implementation:
 
 - seccomp: diff against libseccomp's output for the same policy (as a dev-only
   comparison, not a dependency)
-- netlink: capture what `ip` sends using an `nlmon` interface, store as golden
+- netlink: capture what `ip` sends using an `nlmon` interface, store as golden.
+  `scripts/capture-netlink.sh` does the capture; the comparison lives in
+  `src/net/veth.rs` beside the message builders, which are split from the
+  senders so a message can be built and inspected without a socket
 
 This is the tier that catches a filter that is subtly wrong but still loads —
 the failure mode that manual testing never finds.

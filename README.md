@@ -3,8 +3,8 @@
 A Linux container runtime in Rust. See [SPEC.md](SPEC.md) for what it is and
 where it is going.
 
-Phases 1 and 2 are done: namespaces, mount setup, `pivot_root`, and cgroup v2
-limits.
+Phases 1 to 3 are done: namespaces, mount setup, `pivot_root`, cgroup v2 limits,
+and hand-assembled rtnetlink for veth networking.
 
 ## Build
 
@@ -27,11 +27,22 @@ parent user namespace.
 ```
 quilt run [--hostname NAME] [--ro SRC[:DST]]...
           [--memory SIZE] [--cpus N] [--pids N]
+          [--net none|bridge]
           <ROOTFS> <COMMAND>...
 ```
 
 `--memory` covers swap as well as memory, so the ceiling cannot be escaped by
 swapping. The OCI spec separates the two, and phase 4 honours that split.
+
+`--net bridge` puts the container on a shared `quilt0` bridge with NAT for
+egress. It is deliberately outside the OCI path — the runtime spec does not
+cover networking — so it exists on this CLI only.
+
+It changes host state that outlives the container: `quilt0`, an nftables table
+called `quilt`, and `net.ipv4.ip_forward`, which it sets to 1 and does not set
+back. Forwarding is host-wide, and by the time a container exits something else
+may be relying on it. quilt says on stderr when it is the one turning it on.
+The veth pair is the only part torn down per container.
 
 ## Test
 
@@ -41,3 +52,7 @@ scripts/root-tests.sh   # phase 1 acceptance; builds as you, runs as root
 ```
 
 `scripts/root-tests.sh` will ask for your sudo password.
+
+The netlink golden tests compare against captures of what `ip` puts on the wire.
+They skip until those exist; `sudo scripts/capture-netlink.sh` records them into
+`tests/golden/`, and they are meant to be committed.

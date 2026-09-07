@@ -18,6 +18,16 @@ impl Error {
     pub fn msg(context: impl Into<String>) -> Self {
         Self { context: context.into(), errno: None }
     }
+
+    pub fn from_errno(context: impl Into<String>, errno: rustix::io::Errno) -> Self {
+        Self { context: context.into(), errno: Some(errno) }
+    }
+
+    /// The underlying failure, where there was one. Netlink callers use it to
+    /// tolerate an EEXIST that means the desired state already holds.
+    pub fn errno(&self) -> Option<rustix::io::Errno> {
+        self.errno
+    }
 }
 
 impl fmt::Display for Error {

@@ -98,6 +98,22 @@ fn spawn_running(flags: &[&str], name: &str) -> (std::process::Child, PathBuf) {
     (child, marker)
 }
 
+/// Every interface on the host, by name.
+fn host_links() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return Vec::new();
+    };
+    entries.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect()
+}
+
+fn host_reaches_the_internet() -> bool {
+    Command::new("ping")
+        .args(["-c", "1", "-W", "3", "1.1.1.1"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 fn host_mount_points() -> BTreeSet<String> {
     std::fs::read_to_string("/proc/self/mountinfo")
         .expect("reading host mountinfo")
@@ -389,4 +405,89 @@ fn a_scope_is_removed_even_when_the_container_fails_to_start() {
     assert!(!failed.status.success(), "a missing workload should have failed");
     let leftover = scopes();
     assert!(leftover.is_empty(), "a failed start left a scope behind: {leftover:?}");
+}
+
+#[test]
+fn a_bridge_container_gets_an_address_and_a_default_route() {
+    requires_root!();
+    let addresses = inside_with(&["--net", "bridge"], "ip -4 addr show eth0");
+    assert!(addresses.contains("10.88."), "eth0 has no address in the subnet: {addresses}");
+    assert!(addresses.contains("/16"), "the prefix length did not survive: {addresses}");
+
+    let routes = inside_with(&["--net", "bridge"], "ip route");
+    assert!(
+        routes.contains("default via 10.88.0.1"),
+        "no default route through the bridge: {routes}"
+    );
+}
+
+#[test]
+fn a_bridge_container_reaches_its_gateway() {
+    requires_root!();
+    // The gateway is the bridge itself, so this passes with no internet and
+    // isolates the veth and routing from anything upstream.
+    let out = quilt(&["--net", "bridge"], "ping -c 1 -W 3 10.88.0.1");
+    assert!(
+        out.status.success(),
+        "could not reach the bridge: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_bridge_container_reaches_the_internet() {
+    requires_root!();
+    if !host_reaches_the_internet() {
+        // Only the NAT hop goes untested here; the veth, the bridge and the
+        // routing are covered by the gateway test, which needs no internet.
+        eprintln!("skipped: the host cannot reach 1.1.1.1 either, so neither can a container");
+        return;
+    }
+
+    let out = quilt(&["--net", "bridge"], "ping -c 1 -W 5 1.1.1.1");
+    assert!(
+        out.status.success(),
+        "masquerading did not carry the container out: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn the_veth_does_not_outlive_the_container() {
+    requires_root!();
+    assert_eq!(inside_with(&["--net", "bridge"], "echo done").trim(), "done");
+
+    let leftover: Vec<String> =
+        host_links().into_iter().filter(|name| name.starts_with("qv")).collect();
+    assert!(leftover.is_empty(), "veth ends survived the container: {leftover:?}");
+}
+
+#[test]
+fn the_bridge_is_shared_rather_than_recreated() {
+    requires_root!();
+    // quilt0 outlives containers on purpose: it is the shared fabric, and
+    // tearing it down would cut off anything else still attached.
+    assert_eq!(inside_with(&["--net", "bridge"], "echo done").trim(), "done");
+    assert!(host_links().contains(&"quilt0".to_string()), "the bridge went away");
+}
+
+#[test]
+fn two_containers_at_once_do_not_collide() {
+    requires_root!();
+    let (mut first, first_marker) = spawn_running(&["--net", "bridge"], "quilt-net-a");
+    let (mut second, second_marker) = spawn_running(&["--net", "bridge"], "quilt-net-b");
+    let started = first_marker.exists() && second_marker.exists();
+
+    let veths: Vec<String> =
+        host_links().into_iter().filter(|name| name.starts_with("qv")).collect();
+
+    first.wait().expect("waiting for the first container");
+    second.wait().expect("waiting for the second container");
+    std::fs::remove_file(&first_marker).ok();
+    std::fs::remove_file(&second_marker).ok();
+
+    assert!(started, "both containers should have reached their workload");
+    assert_eq!(veths.len(), 2, "expected one veth each, found {veths:?}");
 }
