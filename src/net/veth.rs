@@ -507,9 +507,20 @@ mod tests {
         let theirs = netlink::parse(&golden("link-up.hex"), 16, &[]).unwrap();
         let ours = netlink::parse(&set_up_message("qvgolden").finish(0), 16, &[]).unwrap();
 
-        assert_eq!(ours.kind, theirs.kind, "both are RTM_SETLINK");
+        // iproute2 modifies an existing link with RTM_NEWLINK minus
+        // NLM_F_CREATE; quilt uses RTM_SETLINK, which is the message named for
+        // the job. The kernel registers a handler for both and they end up in
+        // the same place, so the capture accepts either and this records which.
+        assert!(
+            matches!(theirs.kind, netlink::RTM_NEWLINK | netlink::RTM_SETLINK),
+            "ip sent an unexpected message type {}",
+            theirs.kind
+        );
+        assert_eq!(ours.kind, netlink::RTM_SETLINK);
+
         // ifi_flags and ifi_change, the last two words of ifinfomsg: which bits
         // are being set, and which of them this message is authoritative for.
+        // This is the part that actually has to agree.
         assert_eq!(ours.payload[8..16], theirs.payload[8..16]);
 
         // The accepted divergence, asserted rather than glossed over: iproute2
