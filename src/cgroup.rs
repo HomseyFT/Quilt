@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::error::{Context, Error, Result};
+use crate::spec;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const PARENT: &str = "quilt";
@@ -38,29 +39,64 @@ pub trait CgroupDriver {
     fn scope(&self) -> Result<PathBuf>;
 }
 
-/// Scopes under `/sys/fs/cgroup/quilt/<id>`. Requires root.
+/// Scopes under the unified hierarchy. Requires root.
 pub struct RootCgroup {
-    id: String,
+    /// Where the scope sits relative to `/sys/fs/cgroup`.
+    relative: PathBuf,
 }
 
 impl RootCgroup {
+    /// quilt's own layout, `quilt/<id>`, for the bespoke CLI.
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into() }
+        Self { relative: Path::new(PARENT).join(id.into()) }
+    }
+
+    /// The scope an OCI bundle names, or quilt's own when it names none.
+    ///
+    /// The systemd form of `cgroupsPath` is refused earlier, by
+    /// `spec::Config::validate`, so anything arriving here is a plain path.
+    pub fn from_config(id: &str, cgroups_path: Option<&str>) -> Result<Self> {
+        let Some(path) = cgroups_path else {
+            return Ok(Self::new(id));
+        };
+
+        let relative = path.trim_start_matches('/');
+        if relative.is_empty() {
+            return Err(Error::msg(
+                "cgroupsPath is the cgroup root, which cannot hold a container".to_string(),
+            ));
+        }
+        if relative.split('/').any(|part| part == "." || part == ".." || part.is_empty()) {
+            return Err(Error::msg(format!("cgroupsPath {path:?} is not a plain path")));
+        }
+        Ok(Self { relative: PathBuf::from(relative) })
     }
 }
 
 impl CgroupDriver for RootCgroup {
     fn scope(&self) -> Result<PathBuf> {
-        let parent = Path::new(CGROUP_ROOT).join(PARENT);
-        std::fs::create_dir_all(&parent)
-            .context(|| format!("creating {}", parent.display()))?;
-        enable_controllers(&parent)?;
+        let root = Path::new(CGROUP_ROOT);
+
+        // Every directory between the root and the leaf has to exist and has to
+        // have the controllers enabled for its children, or the leaf's limit
+        // files never appear. The failure is an ENOENT on a write, which says
+        // nothing about which ancestor was the problem.
+        let components: Vec<_> = self.relative.iter().collect();
+        let (leaf, ancestors) = components.split_last().expect("from_config rejects an empty path");
+
+        let mut dir = root.to_path_buf();
+        enable_controllers(&dir)?;
+        for ancestor in ancestors {
+            dir = dir.join(ancestor);
+            std::fs::create_dir_all(&dir).context(|| format!("creating {}", dir.display()))?;
+            enable_controllers(&dir)?;
+        }
 
         // Deliberately not create_dir_all: a directory that is already there is
         // a scope some earlier run left behind, and its limit files are not
         // this container's. Reusing it would silently apply them, because
         // `Limits::files` only writes the limits that were actually asked for.
-        let scope = parent.join(&self.id);
+        let scope = dir.join(leaf);
         match std::fs::create_dir(&scope) {
             Ok(()) => Ok(scope),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(Error::msg(format!(
@@ -88,44 +124,114 @@ fn enable_controllers(parent: &Path) -> Result<()> {
         )));
     }
 
-    let directive = subtree_control_directive(CONTROLLERS);
+    // Only the ones that are not on yet. The cgroup root belongs to systemd on
+    // this machine, and there is no reason to write to it when the answer is
+    // already what quilt wants.
+    let enabled = std::fs::read_to_string(parent.join("cgroup.subtree_control"))
+        .context(|| format!("reading {}/cgroup.subtree_control", parent.display()))?;
+    let missing = missing_controllers(&enabled);
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let directive = subtree_control_directive(&missing);
     std::fs::write(parent.join("cgroup.subtree_control"), &directive)
         .context(|| format!("enabling {directive:?} in {}", parent.display()))
+}
+
+/// Which of the controllers quilt needs are not yet enabled for children.
+fn missing_controllers(enabled: &str) -> Vec<&'static str> {
+    let enabled: Vec<&str> = enabled.split_whitespace().collect();
+    CONTROLLERS.iter().copied().filter(|c| !enabled.contains(c)).collect()
 }
 
 fn subtree_control_directive(controllers: &[&str]) -> String {
     controllers.iter().map(|c| format!("+{c}")).collect::<Vec<_>>().join(" ")
 }
 
-/// What the caller asked for. `None` means the cgroup default, which is `max`.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// What to write into the scope. `None` leaves the cgroup default, `max`.
+///
+/// These are the cgroup files themselves rather than a friendlier shape,
+/// because two callers translate onto them and they disagree: the bespoke CLI
+/// takes `--cpus 0.5`, while an OCI bundle gives a quota and a period. Keeping
+/// the translation at the edges leaves one thing to test here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Limits {
-    pub memory: Option<u64>,
-    pub cpus: Option<f64>,
-    pub pids: Option<u64>,
+    pub memory_max: Option<u64>,
+    pub memory_swap_max: Option<u64>,
+    /// Quota and period, both in microseconds.
+    pub cpu_max: Option<(u64, u64)>,
+    pub pids_max: Option<u64>,
 }
 
 impl Limits {
-    /// The cgroup files to write, in the order they are written.
-    fn files(&self) -> Result<Vec<(&'static str, String)>> {
-        let mut files = Vec::new();
-
-        if let Some(bytes) = self.memory {
-            files.push(("memory.max", bytes.to_string()));
-            // Without this the ceiling is escapable. Under pressure the kernel
-            // swaps anonymous pages out to stay under memory.max rather than
-            // OOM-killing, so `--memory` here means memory *and* swap. The OCI
-            // spec has a separate field for the two, which phase 4 honours.
-            files.push(("memory.swap.max", "0".to_string()));
-        }
-        if let Some(cpus) = self.cpus {
-            files.push(("cpu.max", cpu_max(cpus)?));
-        }
-        if let Some(pids) = self.pids {
-            files.push(("pids.max", pids.to_string()));
-        }
-        Ok(files)
+    /// From the bespoke CLI's flags.
+    ///
+    /// `--memory` covers swap as well: without that the kernel swaps anonymous
+    /// pages out to stay under `memory.max` rather than OOM-killing, and on a
+    /// machine with zram the ceiling is not a ceiling. The OCI path keeps the
+    /// two apart, because the spec does.
+    pub fn from_cli(memory: Option<u64>, cpus: Option<f64>, pids: Option<u64>) -> Result<Self> {
+        Ok(Self {
+            memory_max: memory,
+            memory_swap_max: memory.map(|_| 0),
+            cpu_max: cpus.map(quota_for).transpose()?,
+            pids_max: pids,
+        })
     }
+
+    /// From an OCI bundle's `linux.resources`.
+    pub fn from_oci(resources: Option<&spec::Resources>) -> Result<Self> {
+        let Some(resources) = resources else {
+            return Ok(Self::default());
+        };
+
+        let memory = resources.memory.as_ref();
+        let memory_max = memory.and_then(|m| m.limit).and_then(positive);
+
+        Ok(Self {
+            memory_max,
+            // The spec's `swap` is the combined memory+swap ceiling, while the
+            // kernel file is swap alone. A negative value means unlimited, which
+            // is the default, so nothing is written.
+            memory_swap_max: match (memory.and_then(|m| m.swap), memory_max) {
+                (Some(total), Some(limit)) if total >= 0 => {
+                    Some((total as u64).saturating_sub(limit))
+                }
+                _ => None,
+            },
+            cpu_max: match resources.cpu.as_ref() {
+                Some(cpu) => cpu.quota.and_then(positive).map(|quota| {
+                    (quota, cpu.period.filter(|p| *p > 0).unwrap_or(CPU_PERIOD_US))
+                }),
+                None => None,
+            },
+            pids_max: resources.pids.as_ref().map(|p| p.limit).and_then(positive),
+        })
+    }
+
+    /// The cgroup files to write, in the order they are written.
+    fn files(&self) -> Vec<(&'static str, String)> {
+        let mut files = Vec::new();
+        if let Some(bytes) = self.memory_max {
+            files.push(("memory.max", bytes.to_string()));
+        }
+        if let Some(bytes) = self.memory_swap_max {
+            files.push(("memory.swap.max", bytes.to_string()));
+        }
+        if let Some((quota, period)) = self.cpu_max {
+            files.push(("cpu.max", format!("{quota} {period}")));
+        }
+        if let Some(limit) = self.pids_max {
+            files.push(("pids.max", limit.to_string()));
+        }
+        files
+    }
+}
+
+/// The OCI spec uses a negative value for "no limit", which is the default.
+fn positive(value: i64) -> Option<u64> {
+    (value >= 0).then_some(value as u64)
 }
 
 /// A scope id unique to this invocation.
@@ -153,7 +259,7 @@ impl Scope {
 
 
     pub fn apply(&self, limits: &Limits) -> Result<()> {
-        for (file, value) in limits.files()? {
+        for (file, value) in limits.files() {
             self.write(file, &value)?;
         }
         Ok(())
@@ -219,6 +325,28 @@ impl Scope {
     }
 }
 
+impl Scope {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Hands back the path and disarms the guard.
+    ///
+    /// The OCI lifecycle owns a scope across separate processes: `create`
+    /// builds it and exits, and only `delete` may take it away.
+    pub fn keep(self) -> PathBuf {
+        let path = self.path.clone();
+        std::mem::forget(self);
+        path
+    }
+
+    /// Picks up a scope an earlier `create` left behind, so that dropping this
+    /// tears it down.
+    pub fn adopt(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
 impl Drop for Scope {
     fn drop(&mut self) {
         // A destructor cannot return an error, but a leaked scope is worth
@@ -230,12 +358,11 @@ impl Drop for Scope {
 }
 
 /// `cpu.max` is `<quota> <period>` in microseconds; 0.5 CPUs is half the period.
-pub fn cpu_max(cpus: f64) -> Result<String> {
+pub fn quota_for(cpus: f64) -> Result<(u64, u64)> {
     if !cpus.is_finite() || cpus <= 0.0 {
         return Err(Error::msg(format!("--cpus must be greater than zero, got {cpus}")));
     }
-    let quota = (cpus * CPU_PERIOD_US as f64).round() as u64;
-    Ok(format!("{quota} {CPU_PERIOD_US}"))
+    Ok(((cpus * CPU_PERIOD_US as f64).round() as u64, CPU_PERIOD_US))
 }
 
 /// Parses a size with an optional binary suffix, as `--memory 64M`.
@@ -273,16 +400,16 @@ mod tests {
 
     #[test]
     fn a_cpu_share_becomes_a_quota_over_the_period() {
-        assert_eq!(cpu_max(0.5).unwrap(), "50000 100000");
-        assert_eq!(cpu_max(1.0).unwrap(), "100000 100000");
-        assert_eq!(cpu_max(2.5).unwrap(), "250000 100000");
+        assert_eq!(quota_for(0.5).unwrap(), (50_000, 100_000));
+        assert_eq!(quota_for(1.0).unwrap(), (100_000, 100_000));
+        assert_eq!(quota_for(2.5).unwrap(), (250_000, 100_000));
     }
 
     #[test]
     fn a_nonsense_cpu_share_is_rejected() {
-        assert!(cpu_max(0.0).is_err());
-        assert!(cpu_max(-1.0).is_err());
-        assert!(cpu_max(f64::NAN).is_err());
+        assert!(quota_for(0.0).is_err());
+        assert!(quota_for(-1.0).is_err());
+        assert!(quota_for(f64::NAN).is_err());
     }
 
     #[test]
@@ -333,12 +460,12 @@ mod tests {
 
     #[test]
     fn no_limits_writes_nothing() {
-        assert!(Limits::default().files().unwrap().is_empty());
+        assert!(Limits::default().files().is_empty());
     }
 
     #[test]
-    fn a_memory_limit_also_closes_the_swap_escape() {
-        let files = Limits { memory: Some(67_108_864), ..Limits::default() }.files().unwrap();
+    fn the_cli_memory_flag_also_closes_the_swap_escape() {
+        let files = Limits::from_cli(Some(67_108_864), None, None).unwrap().files();
         assert_eq!(
             files,
             [("memory.max", "67108864".to_string()), ("memory.swap.max", "0".to_string())]
@@ -347,9 +474,39 @@ mod tests {
 
     #[test]
     fn every_limit_maps_to_its_own_file() {
-        let limits = Limits { memory: Some(1024), cpus: Some(0.5), pids: Some(32) };
-        let names: Vec<&str> = limits.files().unwrap().iter().map(|(f, _)| *f).collect();
+        let limits = Limits::from_cli(Some(1024), Some(0.5), Some(32)).unwrap();
+        let names: Vec<&str> = limits.files().iter().map(|(f, _)| *f).collect();
         assert_eq!(names, ["memory.max", "memory.swap.max", "cpu.max", "pids.max"]);
+    }
+
+    #[test]
+    fn nothing_is_written_when_the_controllers_are_already_on() {
+        assert!(missing_controllers("cpuset cpu io memory pids").is_empty());
+    }
+
+    #[test]
+    fn only_the_controllers_that_are_missing_are_enabled() {
+        assert_eq!(missing_controllers("cpu"), ["memory", "pids"]);
+        assert_eq!(missing_controllers(""), ["cpu", "memory", "pids"]);
+    }
+
+    #[test]
+    fn a_bundle_without_a_cgroups_path_gets_quilts_own_layout() {
+        let driver = RootCgroup::from_config("abc123", None).unwrap();
+        assert_eq!(driver.relative, PathBuf::from("quilt/abc123"));
+    }
+
+    #[test]
+    fn a_bundle_cgroups_path_is_taken_relative_to_the_cgroup_root() {
+        let driver =
+            RootCgroup::from_config("abc123", Some("/libpod_parent/libpod-abc123")).unwrap();
+        assert_eq!(driver.relative, PathBuf::from("libpod_parent/libpod-abc123"));
+    }
+
+    #[test]
+    fn a_cgroups_path_that_climbs_out_is_refused() {
+        assert!(RootCgroup::from_config("abc", Some("/../../escape")).is_err());
+        assert!(RootCgroup::from_config("abc", Some("/")).is_err());
     }
 
     #[test]
@@ -369,6 +526,70 @@ mod tests {
 
     #[test]
     fn a_bad_cpu_share_fails_before_anything_is_written() {
-        assert!(Limits { cpus: Some(0.0), ..Limits::default() }.files().is_err());
+        assert!(Limits::from_cli(None, Some(0.0), None).is_err());
+    }
+
+    #[test]
+    fn a_bundle_without_resources_asks_for_nothing() {
+        assert_eq!(Limits::from_oci(None).unwrap(), Limits::default());
+    }
+
+    #[test]
+    fn a_bundle_pids_limit_is_honoured() {
+        let resources = spec::Resources {
+            pids: Some(spec::Pids { limit: 2048 }),
+            ..spec::Resources::default()
+        };
+        assert_eq!(Limits::from_oci(Some(&resources)).unwrap().pids_max, Some(2048));
+    }
+
+    #[test]
+    fn a_negative_bundle_limit_means_unlimited_and_writes_nothing() {
+        // The OCI spec spells "no limit" as a negative number; writing it
+        // through would put a nonsense value in the cgroup file.
+        let resources = spec::Resources {
+            pids: Some(spec::Pids { limit: -1 }),
+            ..spec::Resources::default()
+        };
+        assert_eq!(Limits::from_oci(Some(&resources)).unwrap().pids_max, None);
+    }
+
+    #[test]
+    fn the_bundles_swap_field_is_the_combined_ceiling_not_the_swap_one() {
+        // linux.resources.memory.swap is memory+swap; memory.swap.max is swap
+        // alone, so the difference is what the kernel wants.
+        let resources = spec::Resources {
+            memory: Some(spec::Memory {
+                limit: Some(64 * 1024 * 1024),
+                swap: Some(96 * 1024 * 1024),
+                ..Default::default()
+            }),
+            ..spec::Resources::default()
+        };
+        let limits = Limits::from_oci(Some(&resources)).unwrap();
+        assert_eq!(limits.memory_max, Some(67_108_864));
+        assert_eq!(limits.memory_swap_max, Some(33_554_432));
+    }
+
+    #[test]
+    fn a_bundle_memory_limit_without_swap_leaves_swap_alone() {
+        // Unlike the CLI flag: the spec says nothing about swap here, and
+        // inventing a zero would be a limit the caller never asked for.
+        let resources = spec::Resources {
+            memory: Some(spec::Memory { limit: Some(1024), ..Default::default() }),
+            ..spec::Resources::default()
+        };
+        let limits = Limits::from_oci(Some(&resources)).unwrap();
+        assert_eq!(limits.memory_max, Some(1024));
+        assert_eq!(limits.memory_swap_max, None);
+    }
+
+    #[test]
+    fn a_bundle_cpu_quota_keeps_its_own_period() {
+        let resources = spec::Resources {
+            cpu: Some(spec::Cpu { quota: Some(25_000), period: Some(50_000), ..Default::default() }),
+            ..spec::Resources::default()
+        };
+        assert_eq!(Limits::from_oci(Some(&resources)).unwrap().cpu_max, Some((25_000, 50_000)));
     }
 }

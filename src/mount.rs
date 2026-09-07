@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use rustix::mount::{self, MountFlags, MountPropagationFlags, UnmountFlags};
 
 use crate::error::{Context, Error, Result};
+use crate::spec;
 use crate::syscall;
 
 /// What `apply` must do to make a mount point exist before mounting on it.
@@ -42,6 +43,11 @@ pub enum MountOp {
     },
     Symlink { original: String, link: PathBuf },
     PivotRoot { new_root: PathBuf },
+    /// Hide a path inside the container. Applied after the pivot, so the path
+    /// is container-absolute.
+    Mask { path: PathBuf },
+    /// Make a path inside the container read-only, likewise after the pivot.
+    Freeze { path: PathBuf },
 }
 
 impl MountOp {
@@ -54,6 +60,7 @@ impl MountOp {
             | MountOp::Bind { target, .. } => target,
             MountOp::Symlink { link, .. } => link,
             MountOp::PivotRoot { new_root } => new_root,
+            MountOp::Mask { path } | MountOp::Freeze { path } => path,
         }
     }
 }
@@ -77,6 +84,14 @@ pub trait MountStrategy {
 
 /// The device nodes the spec calls minimal.
 const DEVICES: &[&str] = &["null", "zero", "random", "urandom", "tty"];
+
+/// The devices the runtime spec says a runtime MUST provide.
+///
+/// A bundle does not list these — podman's `linux.devices` is empty and its
+/// mount list stops at putting a tmpfs on `/dev`. Leaving them out is not a
+/// missing convenience: masking a path binds `/dev/null` over it, so without
+/// this the whole `maskedPaths` pass fails on a container that has no `/dev`.
+const OCI_DEFAULT_DEVICES: &[&str] = &["null", "zero", "full", "random", "urandom", "tty"];
 
 /// `/dev` symlinks every shell expects to find.
 const DEV_SYMLINKS: &[(&str, &str)] = &[
@@ -202,6 +217,254 @@ impl MountStrategy for StandardMounts {
     }
 }
 
+/// The mount table an OCI bundle asks for.
+///
+/// Unlike [`StandardMounts`], nothing here is quilt's idea of a sensible
+/// container: every filesystem, every option string and every masked path comes
+/// out of `config.json`, because the caller is entitled to decide those.
+pub struct OciMounts {
+    mounts: Vec<OciMount>,
+    masked_paths: Vec<PathBuf>,
+    readonly_paths: Vec<PathBuf>,
+    mount_label: Option<String>,
+    readonly_root: bool,
+}
+
+/// One entry of the config's mount list, reduced to what `prepare` needs.
+struct OciMount {
+    destination: PathBuf,
+    kind: Option<String>,
+    source: Option<String>,
+    options: Vec<String>,
+}
+
+impl OciMounts {
+    pub fn new(config: &spec::Config) -> Self {
+        Self {
+            mounts: config
+                .mounts
+                .iter()
+                .map(|m| OciMount {
+                    destination: m.destination.clone(),
+                    kind: m.kind.clone(),
+                    source: m.source.clone(),
+                    options: m.options.clone(),
+                })
+                .collect(),
+            masked_paths: config.linux.masked_paths.clone(),
+            readonly_paths: config.linux.readonly_paths.clone(),
+            mount_label: config.linux.mount_label.clone(),
+            readonly_root: config.root.readonly,
+        }
+    }
+}
+
+impl MountStrategy for OciMounts {
+    fn prepare(&self, rootfs: &Path) -> Result<MountPlan> {
+        if !rootfs.is_absolute() {
+            return Err(Error::msg(format!("rootfs {} must be absolute", rootfs.display())));
+        }
+
+        let mut ops = vec![
+            MountOp::Propagation {
+                target: PathBuf::from("/"),
+                flags: MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
+            },
+            MountOp::Bind {
+                source: rootfs.to_path_buf(),
+                target: rootfs.to_path_buf(),
+                recursive: true,
+                readonly: false,
+                create: Create::Nothing,
+            },
+        ];
+
+        for mount in &self.mounts {
+            ops.push(self.op_for(mount, rootfs)?);
+        }
+
+        // After the bundle's own mounts, so that the tmpfs on /dev is there to
+        // put them in, and any devpts is mounted for /dev/ptmx to point at.
+        if self.mounts.iter().any(|m| m.destination == Path::new("/dev")) {
+            ops.extend(default_devices(rootfs));
+            if self.mounts.iter().any(|m| m.destination == Path::new("/dev/pts")) {
+                ops.push(MountOp::Symlink {
+                    original: "pts/ptmx".into(),
+                    link: rootfs.join("dev/ptmx"),
+                });
+            }
+        }
+
+        ops.push(MountOp::PivotRoot { new_root: rootfs.to_path_buf() });
+
+        // Masked and read-only paths name locations inside the container, so
+        // they only mean anything once the pivot has happened.
+        for path in &self.masked_paths {
+            ops.push(MountOp::Mask { path: path.clone() });
+        }
+        for path in &self.readonly_paths {
+            ops.push(MountOp::Freeze { path: path.clone() });
+        }
+        if self.readonly_root {
+            ops.push(MountOp::Freeze { path: PathBuf::from("/") });
+        }
+
+        Ok(MountPlan { ops })
+    }
+}
+
+impl OciMounts {
+    fn op_for(&self, mount: &OciMount, rootfs: &Path) -> Result<MountOp> {
+        let destination = mount.destination.strip_prefix("/").map_err(|_| {
+            Error::msg(format!(
+                "mount destination {} must be absolute",
+                mount.destination.display()
+            ))
+        })?;
+        let target = rootfs.join(destination);
+        let (flags, propagation, data) = parse_options(&mount.options);
+
+        let kind = mount.kind.as_deref().unwrap_or("none");
+        if kind == "bind" || flags.contains(MountFlags::BIND) {
+            let source = mount
+                .source
+                .as_deref()
+                .ok_or_else(|| Error::msg(format!("bind to {} has no source", target.display())))?;
+            let source = PathBuf::from(source);
+            let create = if source.is_dir() { Create::Dir } else { Create::File };
+
+            return Ok(MountOp::Bind {
+                source,
+                target,
+                recursive: propagation.is_some_and(|p| p.contains(MountPropagationFlags::REC))
+                    || flags.contains(MountFlags::REC),
+                readonly: flags.contains(MountFlags::RDONLY),
+                create,
+            });
+        }
+
+        // The OCI type "cgroup" predates the unified hierarchy. With cgroup v2
+        // there is one filesystem and it is called cgroup2; mounting the v1
+        // "cgroup" type here would fail on a v2-only host.
+        let fstype = if kind == "cgroup" { "cgroup2" } else { kind };
+
+        Ok(MountOp::Filesystem {
+            source: mount.source.clone().unwrap_or_else(|| kind.to_string()),
+            target,
+            fstype: fstype.to_string(),
+            flags,
+            data: self.data_for(fstype, data),
+            create: Create::Dir,
+        })
+    }
+
+    /// `linux.mountLabel` is an SELinux context, and applying it is nothing
+    /// more than passing `context=` through to `mount(2)`. Only the filesystems
+    /// quilt creates take it; a bind inherits the label of what it binds, and
+    /// proc and sysfs have labels of their own.
+    fn data_for(&self, fstype: &str, mut data: Vec<String>) -> Option<String> {
+        // Not mqueue: it rejects the option outright with EINVAL, which surfaces
+        // as an unexplained mount failure several steps into the plan. SELinux
+        // only accepts a mount-point label on filesystems it can label that
+        // way, and mqueue is not one of them.
+        const LABELLED: &[&str] = &["tmpfs", "devpts"];
+
+        if let Some(label) = &self.mount_label {
+            if LABELLED.contains(&fstype) {
+                data.push(format!("context=\"{label}\""));
+            }
+        }
+        (!data.is_empty()).then(|| data.join(","))
+    }
+}
+
+/// Binds the host's device nodes into the container's `/dev`.
+fn default_devices(rootfs: &Path) -> Vec<MountOp> {
+    let mut ops = Vec::new();
+
+    for device in OCI_DEFAULT_DEVICES {
+        ops.push(MountOp::Bind {
+            source: PathBuf::from("/dev").join(device),
+            target: rootfs.join("dev").join(device),
+            recursive: false,
+            readonly: false,
+            create: Create::File,
+        });
+    }
+    for (original, link) in DEV_SYMLINKS {
+        ops.push(MountOp::Symlink {
+            original: (*original).into(),
+            link: rootfs.join("dev").join(link),
+        });
+    }
+    ops
+}
+
+/// Splits an OCI mount's option strings into mount flags, propagation flags,
+/// and the filesystem-specific data that is left over.
+///
+/// Anything unrecognised is data, not an error: `mode=0755`, `newinstance` and
+/// `ptmxmode=0666` are all filesystem options, and a runtime has no business
+/// keeping a list of every option every filesystem accepts.
+fn parse_options(options: &[String]) -> (MountFlags, Option<MountPropagationFlags>, Vec<String>) {
+    let mut flags = MountFlags::empty();
+    let mut propagation: Option<MountPropagationFlags> = None;
+    let mut data = Vec::new();
+
+    for option in options {
+        let set = |flags: &mut MountFlags, flag| *flags |= flag;
+        let clear = |flags: &mut MountFlags, flag| flags.remove(flag);
+
+        match option.as_str() {
+            "ro" => set(&mut flags, MountFlags::RDONLY),
+            "rw" => clear(&mut flags, MountFlags::RDONLY),
+            "nosuid" => set(&mut flags, MountFlags::NOSUID),
+            "suid" => clear(&mut flags, MountFlags::NOSUID),
+            "noexec" => set(&mut flags, MountFlags::NOEXEC),
+            "exec" => clear(&mut flags, MountFlags::NOEXEC),
+            "nodev" => set(&mut flags, MountFlags::NODEV),
+            "dev" => clear(&mut flags, MountFlags::NODEV),
+            "noatime" => set(&mut flags, MountFlags::NOATIME),
+            "atime" => clear(&mut flags, MountFlags::NOATIME),
+            "nodiratime" => set(&mut flags, MountFlags::NODIRATIME),
+            "diratime" => clear(&mut flags, MountFlags::NODIRATIME),
+            "relatime" => set(&mut flags, MountFlags::RELATIME),
+            "strictatime" => set(&mut flags, MountFlags::STRICTATIME),
+            "nosymfollow" => set(&mut flags, MountFlags::NOSYMFOLLOW),
+            "sync" => set(&mut flags, MountFlags::SYNCHRONOUS),
+            "dirsync" => set(&mut flags, MountFlags::DIRSYNC),
+            "lazytime" => set(&mut flags, MountFlags::LAZYTIME),
+            "bind" => set(&mut flags, MountFlags::BIND),
+            "rbind" => {
+                set(&mut flags, MountFlags::BIND);
+                set(&mut flags, MountFlags::REC);
+            }
+            "private" => propagation = Some(MountPropagationFlags::PRIVATE),
+            "rprivate" => {
+                propagation =
+                    Some(MountPropagationFlags::PRIVATE | MountPropagationFlags::REC)
+            }
+            "shared" => propagation = Some(MountPropagationFlags::SHARED),
+            "rshared" => {
+                propagation = Some(MountPropagationFlags::SHARED | MountPropagationFlags::REC)
+            }
+            "slave" => propagation = Some(MountPropagationFlags::DOWNSTREAM),
+            "rslave" => {
+                propagation =
+                    Some(MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC)
+            }
+            "unbindable" => propagation = Some(MountPropagationFlags::UNBINDABLE),
+            "runbindable" => {
+                propagation =
+                    Some(MountPropagationFlags::UNBINDABLE | MountPropagationFlags::REC)
+            }
+            other => data.push(other.to_string()),
+        }
+    }
+
+    (flags, propagation, data)
+}
+
 impl MountPlan {
     pub fn apply(&self) -> Result<()> {
         for op in &self.ops {
@@ -249,6 +512,37 @@ fn apply_op(op: &MountOp) -> Result<()> {
         }
 
         MountOp::PivotRoot { new_root } => pivot_root(new_root),
+
+        MountOp::Mask { path } => mask(path),
+
+        MountOp::Freeze { path } => {
+            // A path that is not in the image is nothing to protect. runc skips
+            // these too: config.json lists the union of what any image might
+            // have.
+            if !path.exists() {
+                return Ok(());
+            }
+            mount::mount_bind(path, path)
+                .context(|| format!("binding {} onto itself", path.display()))?;
+            set_readonly(path, false)
+        }
+    }
+}
+
+/// Hides a path from the container: an empty read-only tmpfs over a directory,
+/// `/dev/null` over anything else.
+fn mask(path: &Path) -> Result<()> {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+
+    if metadata.is_dir() {
+        let data = std::ffi::CString::new("mode=0755").expect("no interior NUL");
+        mount::mount("tmpfs", path, "tmpfs", MountFlags::RDONLY, Some(data.as_c_str()))
+            .context(|| format!("masking the directory {}", path.display()))
+    } else {
+        mount::mount_bind("/dev/null", path)
+            .context(|| format!("masking {}", path.display()))
     }
 }
 
@@ -435,6 +729,248 @@ mod tests {
     fn mount_attr_matches_mount_attr_size_ver0() {
         assert_eq!(size_of::<MountAttr>(), 32);
         assert_eq!(align_of::<MountAttr>(), 8);
+    }
+
+    fn oci_plan() -> MountPlan {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/podman-unconfined.json");
+        let json = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} is a committed capture: {e}", path.display()));
+        let config = spec::Config::parse(&json).unwrap();
+        OciMounts::new(&config).prepare(Path::new("/srv/rootfs")).unwrap()
+    }
+
+    #[test]
+    fn option_words_become_flags_and_the_rest_becomes_data() {
+        let options: Vec<String> = ["nosuid", "strictatime", "mode=755", "size=65536k"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (flags, propagation, data) = parse_options(&options);
+
+        assert_eq!(flags, MountFlags::NOSUID | MountFlags::STRICTATIME);
+        assert_eq!(propagation, None);
+        assert_eq!(data, ["mode=755", "size=65536k"]);
+    }
+
+    #[test]
+    fn devpts_options_are_data_not_unknown_flags() {
+        // newinstance and ptmxmode belong to the filesystem. Treating an
+        // unrecognised word as an error would reject a legal bundle.
+        let options: Vec<String> = ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "gid=5"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (flags, _, data) = parse_options(&options);
+
+        assert_eq!(flags, MountFlags::NOSUID | MountFlags::NOEXEC);
+        assert_eq!(data, ["newinstance", "ptmxmode=0666", "gid=5"]);
+    }
+
+    #[test]
+    fn rw_and_exec_undo_their_negatives() {
+        let options: Vec<String> =
+            ["ro", "rw", "noexec", "exec"].iter().map(|s| s.to_string()).collect();
+        let (flags, _, _) = parse_options(&options);
+        assert_eq!(flags, MountFlags::empty());
+    }
+
+    #[test]
+    fn rbind_is_a_recursive_bind() {
+        let (flags, _, _) = parse_options(&["rbind".to_string()]);
+        assert!(flags.contains(MountFlags::BIND | MountFlags::REC));
+    }
+
+    #[test]
+    fn propagation_words_are_kept_apart_from_mount_flags() {
+        let (flags, propagation, data) = parse_options(&["rprivate".to_string()]);
+        assert_eq!(flags, MountFlags::empty());
+        assert_eq!(
+            propagation,
+            Some(MountPropagationFlags::PRIVATE | MountPropagationFlags::REC)
+        );
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn the_bundle_podman_produces_becomes_a_plan() {
+        let plan = oci_plan();
+
+        assert_eq!(
+            plan.ops[0],
+            MountOp::Propagation {
+                target: PathBuf::from("/"),
+                flags: MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
+            }
+        );
+        assert!(matches!(plan.ops[1], MountOp::Bind { .. }), "the rootfs binds onto itself");
+        assert!(plan.ops.iter().any(|op| op.target() == Path::new("/srv/rootfs/proc")));
+        assert!(plan.ops.iter().any(|op| op.target() == Path::new("/srv/rootfs/dev/pts")));
+    }
+
+    #[test]
+    fn the_default_devices_are_created_because_no_bundle_lists_them() {
+        let plan = oci_plan();
+        for device in OCI_DEFAULT_DEVICES {
+            let target = format!("/srv/rootfs/dev/{device}");
+            assert!(
+                plan.ops.iter().any(|op| op.target() == Path::new(&target)),
+                "the runtime spec requires /dev/{device}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_devices_land_after_the_dev_tmpfs_and_before_the_pivot() {
+        let plan = oci_plan();
+        let dev = position(&plan, "/srv/rootfs/dev");
+        let null = position(&plan, "/srv/rootfs/dev/null");
+        let pivot =
+            plan.ops.iter().position(|op| matches!(op, MountOp::PivotRoot { .. })).unwrap();
+
+        assert!(dev < null, "the device nodes need the tmpfs to be there first");
+        assert!(null < pivot);
+    }
+
+    #[test]
+    fn masking_a_path_has_a_dev_null_to_bind_over_it() {
+        // The two are connected: `mask` binds /dev/null over a file, so a
+        // container with masked paths and no /dev/null cannot be created.
+        let plan = oci_plan();
+        let null = position(&plan, "/srv/rootfs/dev/null");
+        let masked =
+            plan.ops.iter().position(|op| matches!(op, MountOp::Mask { .. })).unwrap();
+        assert!(null < masked);
+    }
+
+    #[test]
+    fn ptmx_points_into_the_devpts_instance() {
+        let plan = oci_plan();
+        let op = &plan.ops[position(&plan, "/srv/rootfs/dev/ptmx")];
+        assert_eq!(
+            op,
+            &MountOp::Symlink {
+                original: "pts/ptmx".into(),
+                link: PathBuf::from("/srv/rootfs/dev/ptmx"),
+            }
+        );
+    }
+
+    #[test]
+    fn a_bundle_that_does_not_mount_dev_is_left_alone() {
+        // Without a tmpfs on /dev the image's own /dev is what the container
+        // gets, and binding over it would be quilt inventing policy.
+        let json = r#"{
+            "ociVersion": "1.2.1",
+            "process": {"args": ["true"]},
+            "root": {"path": "/rootfs"},
+            "mounts": [{"destination": "/proc", "type": "proc", "source": "proc",
+                        "options": []}]
+        }"#;
+        let config = spec::Config::parse(json).unwrap();
+        let plan = OciMounts::new(&config).prepare(Path::new("/srv/rootfs")).unwrap();
+        assert!(!plan.ops.iter().any(|op| op.target() == Path::new("/srv/rootfs/dev/null")));
+    }
+
+    #[test]
+    fn mqueue_is_not_given_an_selinux_context() {
+        // It answers EINVAL, which arrives as an unexplained mount failure
+        // partway through the plan.
+        let json = r#"{
+            "ociVersion": "1.2.1",
+            "process": {"args": ["true"]},
+            "root": {"path": "/rootfs"},
+            "mounts": [
+                {"destination": "/dev", "type": "tmpfs", "source": "tmpfs", "options": []},
+                {"destination": "/dev/mqueue", "type": "mqueue", "source": "mqueue",
+                 "options": ["nosuid", "noexec", "nodev"]}
+            ],
+            "linux": {"mountLabel": "system_u:object_r:container_file_t:s0:c1,c2"}
+        }"#;
+        let config = spec::Config::parse(json).unwrap();
+        let plan = OciMounts::new(&config).prepare(Path::new("/srv/rootfs")).unwrap();
+
+        let op = &plan.ops[position(&plan, "/srv/rootfs/dev/mqueue")];
+        let MountOp::Filesystem { data, .. } = op else { panic!("expected a filesystem") };
+        assert_eq!(*data, None);
+
+        // The tmpfs still gets it.
+        let dev = &plan.ops[position(&plan, "/srv/rootfs/dev")];
+        let MountOp::Filesystem { data, .. } = dev else { panic!("expected a filesystem") };
+        assert!(data.as_deref().unwrap().contains("context="));
+    }
+
+    #[test]
+    fn the_oci_cgroup_type_becomes_cgroup2() {
+        let plan = oci_plan();
+        let op = plan
+            .ops
+            .iter()
+            .find(|op| op.target() == Path::new("/srv/rootfs/sys/fs/cgroup"))
+            .expect("podman mounts the cgroup hierarchy");
+
+        let MountOp::Filesystem { fstype, .. } = op else { panic!("expected a filesystem") };
+        assert_eq!(fstype, "cgroup2", "the v1 type would fail on a unified host");
+    }
+
+    #[test]
+    fn masked_and_readonly_paths_come_after_the_pivot() {
+        let plan = oci_plan();
+        let pivot = plan
+            .ops
+            .iter()
+            .position(|op| matches!(op, MountOp::PivotRoot { .. }))
+            .expect("the plan pivots");
+
+        let masked =
+            plan.ops.iter().position(|op| matches!(op, MountOp::Mask { .. })).unwrap();
+        let frozen =
+            plan.ops.iter().position(|op| matches!(op, MountOp::Freeze { .. })).unwrap();
+
+        assert!(pivot < masked, "a masked path names a location inside the container");
+        assert!(pivot < frozen);
+        assert!(plan.ops.iter().any(|op| op.target() == Path::new("/proc/kcore")));
+    }
+
+    #[test]
+    fn the_mount_label_reaches_the_filesystems_that_take_one() {
+        let json = r#"{
+            "ociVersion": "1.2.1",
+            "process": {"args": ["true"]},
+            "root": {"path": "/rootfs"},
+            "mounts": [
+                {"destination": "/dev", "type": "tmpfs", "source": "tmpfs",
+                 "options": ["mode=755"]},
+                {"destination": "/proc", "type": "proc", "source": "proc", "options": []}
+            ],
+            "linux": {"mountLabel": "system_u:object_r:container_file_t:s0:c1,c2"}
+        }"#;
+        let config = spec::Config::parse(json).unwrap();
+        let plan = OciMounts::new(&config).prepare(Path::new("/srv/rootfs")).unwrap();
+
+        let tmpfs = plan.ops.iter().find(|op| op.target() == Path::new("/srv/rootfs/dev")).unwrap();
+        let MountOp::Filesystem { data, .. } = tmpfs else { panic!("expected a filesystem") };
+        let data = data.as_deref().unwrap();
+        assert!(data.contains("mode=755"));
+        assert!(data.contains(r#"context="system_u:object_r:container_file_t:s0:c1,c2""#));
+
+        // proc carries its own label; handing it a context= would be wrong.
+        let proc = plan.ops.iter().find(|op| op.target() == Path::new("/srv/rootfs/proc")).unwrap();
+        let MountOp::Filesystem { data, .. } = proc else { panic!("expected a filesystem") };
+        assert_eq!(*data, None);
+    }
+
+    #[test]
+    fn a_readonly_root_is_frozen_last() {
+        let json = r#"{
+            "ociVersion": "1.2.1",
+            "process": {"args": ["true"]},
+            "root": {"path": "/rootfs", "readonly": true},
+            "mounts": []
+        }"#;
+        let config = spec::Config::parse(json).unwrap();
+        let plan = OciMounts::new(&config).prepare(Path::new("/srv/rootfs")).unwrap();
+        assert_eq!(plan.ops.last(), Some(&MountOp::Freeze { path: PathBuf::from("/") }));
     }
 
     #[test]

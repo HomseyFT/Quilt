@@ -3,9 +3,8 @@
 A Linux container runtime in Rust. See [SPEC.md](SPEC.md) for what it is and
 where it is going.
 
-Phases 1 to 3 are done: namespaces, mount setup, `pivot_root`, cgroup v2 limits,
-and hand-assembled rtnetlink for veth networking. Phase 4, the OCI runtime spec,
-is in progress.
+Phases 1 to 4 are done: namespaces, mount setup, `pivot_root`, cgroup v2 limits,
+hand-assembled rtnetlink for veth networking, and the OCI runtime interface.
 
 ## Build
 
@@ -44,6 +43,26 @@ called `quilt`, and `net.ipv4.ip_forward`, which it sets to 1 and does not set
 back. Forwarding is host-wide, and by the time a container exits something else
 may be relying on it. quilt says on stderr when it is the one turning it on.
 The veth pair is the only part torn down per container.
+
+## As an OCI runtime
+
+```sh
+sudo podman --cgroup-manager=cgroupfs --runtime $(pwd)/target/release/quilt run --rm \
+    --security-opt seccomp=unconfined --security-opt label=disable alpine ls /
+```
+
+Three flags more than you would like. Each is the alternative to silently
+ignoring a security field in the bundle, which quilt refuses to do:
+`--security-opt seccomp=unconfined` goes away at phase 5, and the other two are
+non-goals — see SPEC.md.
+
+The verbs work on their own too:
+
+```
+quilt [--root DIR] create --bundle DIR [--pid-file PATH] <ID>
+quilt [--root DIR] start|state|delete [--force] <ID>
+quilt [--root DIR] kill <ID> [SIGNAL]
+```
 
 ## Test
 

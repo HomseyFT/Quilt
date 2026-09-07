@@ -223,7 +223,7 @@ pub struct Resources {
     pub unified: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Memory {
     #[serde(default)]
@@ -246,7 +246,7 @@ pub struct Memory {
     pub check_before_update: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Cpu {
     #[serde(default)]
@@ -269,7 +269,7 @@ pub struct Cpu {
     pub idle: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Pids {
     pub limit: i64,

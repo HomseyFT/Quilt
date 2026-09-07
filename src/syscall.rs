@@ -9,6 +9,10 @@ use rustix::io::Errno;
 pub const SYS_CLONE3: u64 = 435;
 pub const SYS_CLOSE_RANGE: u64 = 436;
 pub const SYS_MOUNT_SETATTR: u64 = 442;
+pub const SYS_PRCTL: u64 = 157;
+
+/// `prctl` option: remove one capability from the bounding set.
+pub const PR_CAPBSET_DROP: u64 = 24;
 
 pub const AT_FDCWD: u64 = -100i64 as u64;
 pub const AT_RECURSIVE: u64 = 0x8000;
@@ -93,6 +97,17 @@ pub unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> 
 pub unsafe fn close_range(first: u32, last: u32, flags: u32) -> Result<(), Errno> {
     let ret =
         unsafe { syscall3(SYS_CLOSE_RANGE, u64::from(first), u64::from(last), u64::from(flags)) };
+    result(ret).map(|_| ())
+}
+
+/// `prctl(option, arg2, 0, 0, 0)`.
+///
+/// rustix wraps most of `prctl`, but its capability calls are keyed by a
+/// `Capability` enum, and quilt works in the raw numbers the OCI spec's
+/// capability names map onto. The unused arguments are passed as zero rather
+/// than left undefined: several options do read them.
+pub fn prctl_2(option: u64, arg2: u64) -> Result<(), Errno> {
+    let ret = unsafe { syscall5(SYS_PRCTL, option, arg2, 0, 0, 0) };
     result(ret).map(|_| ())
 }
 

@@ -1,3 +1,4 @@
+mod caps;
 mod cgroup;
 mod container;
 mod error;
@@ -17,7 +18,7 @@ use crate::cgroup::{Limits, RootCgroup};
 use crate::container::RunSpec;
 use crate::error::{Context, Error, Result};
 use crate::idmap::Identity;
-use crate::init::InitSpec;
+use crate::init::{InitSpec, OciInit as InitOci};
 use crate::net::NetworkMode;
 use crate::net::veth::{self, Endpoint};
 use crate::ns::Namespaces;
@@ -25,6 +26,23 @@ use crate::ns::Namespaces;
 #[derive(Parser)]
 #[command(name = "quilt", version, about = "a container runtime from scratch")]
 struct Cli {
+    /// Where the runtime keeps container state.
+    #[arg(long, global = true, default_value = container::DEFAULT_STATE_ROOT)]
+    root: PathBuf,
+
+    /// Refused. quilt writes cgroup files directly; see SPEC.md's non-goals.
+    #[arg(long, global = true)]
+    systemd_cgroup: bool,
+
+    /// Accepted and unused. Podman passes these to every runtime, and a
+    /// runtime that rejected them could not be dropped in.
+    #[arg(long, global = true, value_name = "PATH")]
+    log: Option<PathBuf>,
+    #[arg(long, global = true, value_name = "FORMAT")]
+    log_format: Option<String>,
+    #[arg(long, global = true)]
+    debug: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -36,6 +54,59 @@ enum Command {
     /// Set up the container and become the workload. Re-exec'd by `run`.
     #[command(hide = true)]
     Init(InitArgs),
+
+    /// Create a container from an OCI bundle and wait on its exec fifo.
+    Create(CreateArgs),
+    /// Run the workload of a container that was created.
+    Start { id: String },
+    /// Print a container's state as JSON.
+    State { id: String },
+    /// Send a signal to a container's process.
+    Kill {
+        id: String,
+        /// A name or number: KILL, SIGKILL and 9 are the same signal.
+        #[arg(default_value = "SIGTERM")]
+        signal: String,
+    },
+    /// Remove a container's state and cgroup.
+    Delete {
+        id: String,
+        /// Kill the container first if it is still running.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Set up a container from a bundle and become its workload. Re-exec'd by
+    /// `create`.
+    #[command(hide = true, name = "init-oci")]
+    InitOci(InitOciArgs),
+}
+
+#[derive(Args)]
+struct CreateArgs {
+    /// The directory holding config.json and the rootfs.
+    #[arg(long)]
+    bundle: PathBuf,
+
+    /// Where to write the container process's pid.
+    #[arg(long, value_name = "PATH")]
+    pid_file: Option<PathBuf>,
+
+    /// Refused: a terminal needs a pty passed back over this socket.
+    #[arg(long, value_name = "PATH")]
+    console_socket: Option<PathBuf>,
+
+    id: String,
+}
+
+#[derive(Args)]
+struct InitOciArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+    #[arg(long)]
+    fifo: PathBuf,
+    #[arg(long)]
+    ready_fd: std::os::fd::RawFd,
 }
 
 #[derive(Args)]
@@ -104,6 +175,14 @@ fn main() {
 }
 
 fn dispatch(cli: Cli) -> Result<i32> {
+    if cli.systemd_cgroup {
+        return Err(Error::msg(
+            "--systemd-cgroup asks quilt to have systemd own the container's scope, which it \
+             cannot: podman --cgroup-manager=cgroupfs"
+                .to_string(),
+        ));
+    }
+
     match cli.command {
         Command::Run(args) => run(args),
         Command::Init(args) => {
@@ -123,6 +202,47 @@ fn dispatch(cli: Cli) -> Result<i32> {
             })?;
             unreachable!("init::exec only returns an error")
         }
+
+        Command::Create(args) => {
+            if let Some(path) = &args.console_socket {
+                return Err(Error::msg(format!(
+                    "--console-socket {} asks quilt to hand back a pty, which it does not \
+                     create: run podman without -t",
+                    path.display()
+                )));
+            }
+            container::create(&cli.root, &args.id, &args.bundle, args.pid_file.as_deref())?;
+            Ok(0)
+        }
+
+        Command::Start { id } => {
+            container::start(&cli.root, &id)?;
+            Ok(0)
+        }
+
+        Command::State { id } => {
+            println!("{}", container::print_state(&cli.root, &id)?);
+            Ok(0)
+        }
+
+        Command::Kill { id, signal } => {
+            container::kill(&cli.root, &id, &signal)?;
+            Ok(0)
+        }
+
+        Command::Delete { id, force } => {
+            container::delete(&cli.root, &id, force)?;
+            Ok(0)
+        }
+
+        Command::InitOci(args) => {
+            init::exec_oci(InitOci {
+                bundle: args.bundle,
+                fifo: args.fifo,
+                ready_fd: args.ready_fd,
+            })?;
+            unreachable!("init::exec_oci only returns an error")
+        }
     }
 }
 
@@ -141,15 +261,11 @@ fn run(args: RunArgs) -> Result<i32> {
         .map(|value| readonly_bind(value))
         .collect::<Result<Vec<_>>>()?;
 
-    let limits = Limits {
-        memory: args.memory.as_deref().map(cgroup::parse_size).transpose()?,
-        cpus: args.cpus,
-        pids: args.pids,
-    };
-    // Validated here so a bad --cpus fails before a container is built.
-    if let Some(cpus) = limits.cpus {
-        cgroup::cpu_max(cpus)?;
-    }
+    let limits = Limits::from_cli(
+        args.memory.as_deref().map(cgroup::parse_size).transpose()?,
+        args.cpus,
+        args.pids,
+    )?;
 
     // The runtime's own pid is unique among the containers running at any one
     // time, which is all the address and interface name need.

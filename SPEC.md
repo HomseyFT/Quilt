@@ -272,6 +272,20 @@ first changed four decisions:
 - `devpts` is in the mount list, which settles the `/dev/pts` question phase 1
   deferred — podman states the options, so there is nothing to guess
 
+Two things a bundle does not say, which the runtime owes it anyway:
+
+- **The default devices.** `linux.devices` is empty and the mount list stops at
+  putting a tmpfs on `/dev`, because the spec makes `/dev/null`, `zero`, `full`,
+  `random`, `urandom` and `tty` the runtime's job. This is not a missing
+  convenience: masking a path binds `/dev/null` over it, so a container with
+  `maskedPaths` and an empty `/dev` cannot be created at all
+- **`/dev/ptmx`**, as a symlink into the devpts instance, when one is mounted
+
+And one the bundle says that cannot be taken literally: `linux.mountLabel`
+survives `--security-opt label=disable`, and it is honoured by passing
+`context=` to `mount(2)` — but only for tmpfs and devpts. mqueue answers EINVAL,
+which arrives as an unexplained mount failure several steps into the plan.
+
 `process` and `linux` deserialize with `deny_unknown_fields`. They are where the
 security-bearing settings live, and a field quilt has never heard of is exactly
 the one it must not skip past. The price is that a future podman adding a field

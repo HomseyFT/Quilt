@@ -5,9 +5,10 @@
 //! `struct clone_args` is the interface this project exists to learn.
 
 use crate::error::{Context, Error, Result};
+use crate::spec::{Namespace, NamespaceKind};
 use crate::syscall;
 use rustix::process::Pid;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 pub const CLONE_NEWNS: u64 = 0x0002_0000;
 pub const CLONE_NEWCGROUP: u64 = 0x0200_0000;
@@ -75,6 +76,102 @@ impl Namespaces {
         }
         flags
     }
+}
+
+/// The order in which namespaces given by path must be joined.
+///
+/// A user namespace comes first: everything after it depends on the credentials
+/// it grants. The mount namespace comes late, because joining it changes which
+/// `/proc/<pid>/ns` files are reachable to join the rest by.
+const ENTRY_ORDER: &[NamespaceKind] = &[
+    NamespaceKind::User,
+    NamespaceKind::Ipc,
+    NamespaceKind::Uts,
+    NamespaceKind::Network,
+    NamespaceKind::Cgroup,
+    NamespaceKind::Pid,
+    NamespaceKind::Mount,
+];
+
+impl Namespaces {
+    /// The namespaces a bundle asks to be created.
+    ///
+    /// One given by path is joined instead, and must not also appear in the
+    /// clone flags: asking for both would make a fresh namespace and then
+    /// abandon it, which looks like it worked.
+    pub fn to_create(namespaces: &[Namespace]) -> Result<Self> {
+        let mut set = Self {
+            mount: false,
+            pid: false,
+            net: false,
+            uts: false,
+            ipc: false,
+            user: false,
+            cgroup: false,
+        };
+
+        for namespace in namespaces {
+            if namespace.path.is_some() {
+                continue;
+            }
+            match namespace.kind {
+                NamespaceKind::Mount => set.mount = true,
+                NamespaceKind::Pid => set.pid = true,
+                NamespaceKind::Network => set.net = true,
+                NamespaceKind::Uts => set.uts = true,
+                NamespaceKind::Ipc => set.ipc = true,
+                NamespaceKind::User => set.user = true,
+                NamespaceKind::Cgroup => set.cgroup = true,
+                NamespaceKind::Time => {
+                    return Err(Error::msg(
+                        "config.json asks for a time namespace, which quilt does not create"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(set)
+    }
+}
+
+/// Joins namespaces that already exist, in [`ENTRY_ORDER`].
+pub fn join_all(namespaces: &[Namespace]) -> Result<()> {
+    for kind in ENTRY_ORDER {
+        for namespace in namespaces.iter().filter(|n| n.kind == *kind) {
+            let Some(path) = &namespace.path else { continue };
+            join(*kind, path)?;
+        }
+    }
+    Ok(())
+}
+
+fn join(kind: NamespaceKind, path: &std::path::Path) -> Result<()> {
+    use rustix::thread::LinkNameSpaceType;
+
+    let which = match kind {
+        NamespaceKind::Mount => LinkNameSpaceType::Mount,
+        NamespaceKind::Pid => LinkNameSpaceType::ProcessID,
+        NamespaceKind::Network => LinkNameSpaceType::Network,
+        NamespaceKind::Uts => LinkNameSpaceType::HostNameAndNISDomainName,
+        NamespaceKind::Ipc => LinkNameSpaceType::InterProcessCommunication,
+        NamespaceKind::User => LinkNameSpaceType::User,
+        NamespaceKind::Cgroup => LinkNameSpaceType::ControlGroup,
+        NamespaceKind::Time => {
+            return Err(Error::msg(
+                "config.json asks to join a time namespace, which quilt does not".to_string(),
+            ));
+        }
+    };
+
+    let fd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .context(|| format!("opening the namespace at {}", path.display()))?;
+
+    rustix::thread::move_into_link_name_space(fd.as_fd(), Some(which))
+        .context(|| format!("joining the namespace at {}", path.display()))
 }
 
 /// `struct clone_args` as of `CLONE_ARGS_SIZE_VER2`.
@@ -185,6 +282,58 @@ mod tests {
             cgroup: false,
         };
         assert_eq!(none.clone_flags(), 0);
+    }
+
+    fn namespace(kind: NamespaceKind, path: Option<&str>) -> Namespace {
+        Namespace { kind, path: path.map(std::path::PathBuf::from) }
+    }
+
+    #[test]
+    fn a_namespace_given_by_path_is_not_also_created() {
+        // podman pre-creates the netns and passes its path. Cloning a fresh one
+        // as well would leave the container in a namespace nobody wired up.
+        let set = Namespaces::to_create(&[
+            namespace(NamespaceKind::Pid, None),
+            namespace(NamespaceKind::Network, Some("/run/netns/abc")),
+            namespace(NamespaceKind::Mount, None),
+        ])
+        .unwrap();
+
+        assert!(set.pid);
+        assert!(set.mount);
+        assert!(!set.net);
+        assert_eq!(set.clone_flags() & CLONE_NEWNET, 0);
+    }
+
+    #[test]
+    fn the_namespace_set_podman_sends_becomes_clone_flags() {
+        let set = Namespaces::to_create(&[
+            namespace(NamespaceKind::Pid, None),
+            namespace(NamespaceKind::Network, Some("/run/netns/abc")),
+            namespace(NamespaceKind::Ipc, None),
+            namespace(NamespaceKind::Uts, None),
+            namespace(NamespaceKind::Mount, None),
+            namespace(NamespaceKind::Cgroup, None),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            set.clone_flags(),
+            CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWCGROUP
+        );
+        assert!(!set.user, "podman makes the user namespace outside the runtime");
+    }
+
+    #[test]
+    fn a_time_namespace_is_refused_rather_than_dropped() {
+        assert!(Namespaces::to_create(&[namespace(NamespaceKind::Time, None)]).is_err());
+    }
+
+    #[test]
+    fn the_user_namespace_is_entered_before_anything_that_depends_on_it() {
+        assert_eq!(ENTRY_ORDER[0], NamespaceKind::User);
+        let mount = ENTRY_ORDER.iter().position(|k| *k == NamespaceKind::Mount).unwrap();
+        assert_eq!(mount, ENTRY_ORDER.len() - 1, "the mount namespace is entered last");
     }
 
     #[test]

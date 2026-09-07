@@ -65,6 +65,39 @@ fn scopes() -> Vec<PathBuf> {
         .collect()
 }
 
+/// Scopes made by `quilt run`, which names them `run-<pid>-<nanos>`.
+///
+/// The bespoke-CLI tests assert that they leave none behind, and asserting on
+/// the whole `quilt/` subtree makes them fail for anything else that is there —
+/// an OCI container mid-test, or the wreckage of an interrupted run. Neither is
+/// what those tests are about.
+fn run_scopes() -> Vec<PathBuf> {
+    scopes()
+        .into_iter()
+        .filter(|path| {
+            path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("run-"))
+        })
+        .collect()
+}
+
+fn scope_of(id: &str) -> PathBuf {
+    PathBuf::from("/sys/fs/cgroup/quilt").join(id)
+}
+
+/// Clears anything an earlier interrupted run left under this container's name.
+fn clear_container(state_root: &PathBuf, id: &str) {
+    std::fs::remove_dir_all(state_root.join(id)).ok();
+
+    let scope = scope_of(id);
+    if scope.exists() {
+        std::fs::write(scope.join("cgroup.kill"), "1").ok();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::fs::remove_dir(&scope).is_err() && deadline > std::time::Instant::now() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
 fn read_trim(path: PathBuf) -> String {
     std::fs::read_to_string(path).unwrap_or_default().trim().to_string()
 }
@@ -318,7 +351,7 @@ fn the_limits_reach_the_scope_the_workload_is_in() {
         spawn_running(&["--memory", "64M", "--cpus", "0.5", "--pids", "32"], "quilt-limits");
     let started = marker.exists();
 
-    let found = scopes();
+    let found = run_scopes();
     let values = found.first().map(|scope| {
         (
             read_trim(scope.join("memory.max")),
@@ -376,7 +409,7 @@ fn a_pids_limit_blocks_a_fork_bomb() {
 fn the_scope_is_gone_once_the_container_exits() {
     requires_root!();
     assert_eq!(inside_with(&["--memory", "64M"], "echo done").trim(), "done");
-    let leftover = scopes();
+    let leftover = run_scopes();
     assert!(leftover.is_empty(), "the scope outlived the container: {leftover:?}");
 }
 
@@ -389,7 +422,7 @@ fn a_straggler_outliving_pid_one_does_not_leak_the_scope() {
     // and the populated wait, the rmdir loses that race with EBUSY.
     assert!(quilt(&[], "sleep 100 & exit 0").status.success());
 
-    let leftover = scopes();
+    let leftover = run_scopes();
     assert!(leftover.is_empty(), "a straggler left the scope behind: {leftover:?}");
 }
 
@@ -403,7 +436,7 @@ fn a_scope_is_removed_even_when_the_container_fails_to_start() {
         .expect("failed to spawn quilt");
 
     assert!(!failed.status.success(), "a missing workload should have failed");
-    let leftover = scopes();
+    let leftover = run_scopes();
     assert!(leftover.is_empty(), "a failed start left a scope behind: {leftover:?}");
 }
 
@@ -490,4 +523,244 @@ fn two_containers_at_once_do_not_collide() {
 
     assert!(started, "both containers should have reached their workload");
     assert_eq!(veths.len(), 2, "expected one veth each, found {veths:?}");
+}
+
+// --- Phase 4: the OCI runtime interface -----------------------------------
+
+/// A bundle with the smallest config.json that is still a real container.
+fn write_bundle(dir: &PathBuf, args: &str) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let config = format!(
+        r#"{{
+            "ociVersion": "1.2.1",
+            "process": {{
+                "args": [{args}],
+                "cwd": "/",
+                "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+                "capabilities": {{"bounding": ["CAP_CHOWN"], "effective": ["CAP_CHOWN"],
+                                  "permitted": ["CAP_CHOWN"]}},
+                "rlimits": [{{"type": "RLIMIT_NOFILE", "hard": 1024, "soft": 1024}}],
+                "noNewPrivileges": true
+            }},
+            "root": {{"path": "{rootfs}"}},
+            "hostname": "quilt-oci",
+            "mounts": [
+                {{"destination": "/proc", "type": "proc", "source": "proc",
+                  "options": ["nosuid", "noexec", "nodev"]}},
+                {{"destination": "/dev", "type": "tmpfs", "source": "tmpfs",
+                  "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]}}
+            ],
+            "linux": {{
+                "namespaces": [{{"type": "pid"}}, {{"type": "ipc"}}, {{"type": "uts"}},
+                               {{"type": "mount"}}, {{"type": "network"}}],
+                "resources": {{"pids": {{"limit": 64}}}},
+                "maskedPaths": ["/proc/kcore"],
+                "readonlyPaths": ["/proc/sys"]
+            }}
+        }}"#,
+        args = args,
+        rootfs = rootfs().display()
+    );
+    std::fs::write(dir.join("config.json"), config).unwrap();
+    dir.clone()
+}
+
+/// Runs `create`, keeping the container's stdio off pipes.
+///
+/// The init process inherits create's descriptors and outlives it, parked on
+/// the exec fifo. `Command::output()` waits for EOF on the pipes it creates, so
+/// piping either stream deadlocks: the test would be waiting on init, which is
+/// waiting on the `start` the test has not reached yet. Files have no such
+/// property. A real caller does the same thing for the same reason — conmon
+/// hands the runtime the descriptors it wants the container to have.
+fn create_container(state_root: &PathBuf, bundle: &PathBuf, id: &str, log: &PathBuf) -> String {
+    let stdout = std::fs::File::create(log).unwrap();
+    let errors = log.with_extension("err");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_quilt"))
+        .arg("--root")
+        .arg(state_root)
+        .args(["create", "--bundle"])
+        .arg(bundle)
+        .arg(id)
+        .stdout(stdout)
+        .stderr(std::fs::File::create(&errors).unwrap())
+        .status()
+        .expect("failed to spawn quilt");
+
+    let stderr = std::fs::read_to_string(&errors).unwrap_or_default();
+    assert!(status.success(), "create failed: {stderr}");
+    stderr
+}
+
+fn quilt_oci(state_root: &PathBuf, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_quilt"))
+        .arg("--root")
+        .arg(state_root)
+        .args(args)
+        .output()
+        .expect("failed to spawn quilt")
+}
+
+fn status_of(state_root: &PathBuf, id: &str) -> String {
+    let out = quilt_oci(state_root, &["state", id]);
+    assert!(
+        out.status.success(),
+        "state failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = String::from_utf8_lossy(&out.stdout);
+    // Small enough not to want a JSON parser in the test.
+    for line in json.lines() {
+        if let Some(rest) = line.trim().strip_prefix("\"status\": \"") {
+            return rest.trim_end_matches("\",").trim_end_matches('"').to_string();
+        }
+    }
+    panic!("no status in {json}");
+}
+
+#[test]
+fn the_lifecycle_verbs_drive_a_container_from_create_to_delete() {
+    requires_root!();
+    let work = std::env::temp_dir().join("quilt-oci-lifecycle");
+    std::fs::remove_dir_all(&work).ok();
+    let bundle = write_bundle(&work.join("bundle"), r#""/bin/sh", "-c", "echo hello""#);
+    let state_root = work.join("state");
+    let log = work.join("stdout");
+    std::fs::create_dir_all(&state_root).unwrap();
+
+    clear_container(&state_root, "lifecycle-test");
+    create_container(&state_root, &bundle, "lifecycle-test", &log);
+
+    // Created, not running: the workload must not have run yet.
+    assert_eq!(status_of(&state_root, "lifecycle-test"), "created");
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "", "the workload ran before start");
+
+    let started = quilt_oci(&state_root, &["start", "lifecycle-test"]);
+    assert!(
+        started.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while status_of(&state_root, "lifecycle-test") != "stopped"
+        && deadline > std::time::Instant::now()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let output = std::fs::read_to_string(&log).unwrap();
+    // init's own stderr goes here, and it is the only place a failure between
+    // `start` and `execve` says anything.
+    let errors = std::fs::read_to_string(log.with_extension("err")).unwrap_or_default();
+    let deleted = quilt_oci(&state_root, &["delete", "lifecycle-test"]);
+    let leftover = scope_of("lifecycle-test").exists();
+    std::fs::remove_dir_all(&work).ok();
+
+    assert_eq!(output.trim(), "hello", "the workload did not run on start: {errors}");
+    assert!(
+        deleted.status.success(),
+        "delete failed: {}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    assert!(!state_root.join("lifecycle-test").exists(), "delete left state behind");
+    assert!(!leftover, "delete left a cgroup scope behind");
+}
+
+#[test]
+fn a_container_that_is_still_running_is_not_deleted_without_force() {
+    requires_root!();
+    let work = std::env::temp_dir().join("quilt-oci-force");
+    std::fs::remove_dir_all(&work).ok();
+    let bundle = write_bundle(&work.join("bundle"), r#""/bin/sh", "-c", "sleep 30""#);
+    let state_root = work.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+
+    clear_container(&state_root, "force-test");
+    create_container(&state_root, &bundle, "force-test", &work.join("stdout"));
+    quilt_oci(&state_root, &["start", "force-test"]);
+
+    let refused = quilt_oci(&state_root, &["delete", "force-test"]);
+    let forced = quilt_oci(&state_root, &["delete", "--force", "force-test"]);
+    let leftover = scope_of("force-test").exists();
+    std::fs::remove_dir_all(&work).ok();
+
+    assert!(!refused.status.success(), "a running container was deleted without --force");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--force"),
+        "the refusal should say what to do: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(forced.status.success(), "{}", String::from_utf8_lossy(&forced.stderr));
+    assert!(!leftover, "--force left a cgroup scope behind");
+}
+
+#[test]
+fn an_unknown_container_is_an_error_not_a_panic() {
+    requires_root!();
+    let state_root = std::env::temp_dir().join("quilt-oci-missing");
+    std::fs::create_dir_all(&state_root).unwrap();
+
+    for verb in [vec!["state", "nope"], vec!["start", "nope"], vec!["delete", "nope"]] {
+        let out = quilt_oci(&state_root, &verb);
+        assert!(!out.status.success(), "{verb:?} should fail");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("nope"),
+            "the error should name the container: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    std::fs::remove_dir_all(&state_root).ok();
+}
+
+/// The phase 4 demo. The three security options are the ones SPEC.md explains:
+/// seccomp is phase 5, and SELinux labelling and systemd scopes are non-goals.
+#[test]
+fn podman_runs_a_container_end_to_end_through_quilt() {
+    requires_root!();
+
+    let present = Command::new("podman")
+        .args(["image", "exists", "alpine"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !present {
+        let pulled = Command::new("podman")
+            .args(["pull", "-q", "alpine"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !pulled {
+            eprintln!("skipped: root podman has no alpine image and could not pull one");
+            return;
+        }
+    }
+
+    let out = Command::new("podman")
+        .args([
+            "--cgroup-manager=cgroupfs",
+            "--runtime",
+            env!("CARGO_BIN_EXE_quilt"),
+            "run",
+            "--rm",
+            "--security-opt",
+            "seccomp=unconfined",
+            "--security-opt",
+            "label=disable",
+            "alpine",
+            "ls",
+            "/",
+        ])
+        .output()
+        .expect("failed to spawn podman");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "podman could not drive quilt: {}{}",
+        stdout,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("etc"), "the container did not list its root: {stdout}");
 }
