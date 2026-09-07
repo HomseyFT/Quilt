@@ -272,6 +272,17 @@ first changed four decisions:
 - `devpts` is in the mount list, which settles the `/dev/pts` question phase 1
   deferred — podman states the options, so there is nothing to guess
 
+The capability work straddles the user change, and the order is forced. The
+bounding-set sweep needs `CAP_SETPCAP` in the *effective* set, and any move off
+uid 0 empties effective outright — `PR_SET_KEEPCAPS` preserves the permitted set
+and nothing else. So the bounding set is narrowed first, while still root, and
+the effective/permitted/inheritable sets are applied afterwards, where raising
+effective out of permitted needs no privilege of its own. Dropping `CAP_SETUID`
+and `CAP_SETGID` from the bounding set does not disturb the copies in effective,
+so becoming the container's user still works in between. None of this is visible
+at uid 0, which is what every default bundle asks for, so the acceptance tests
+include a `--user` case on purpose.
+
 Two things a bundle does not say, which the runtime owes it anyway:
 
 - **The default devices.** `linux.devices` is empty and the mount list stops at

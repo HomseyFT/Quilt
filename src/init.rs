@@ -232,22 +232,20 @@ pub fn exec_oci(init: OciInit) -> Result<std::convert::Infallible> {
         crate::caps::set_no_new_privs()?;
     }
 
-    // The user first, then the capabilities — not the other way round.
-    //
-    // Becoming the container's user needs CAP_SETGID and CAP_SETUID, and a
-    // bundle is entitled to leave those out of the set it wants the workload to
-    // keep. Narrowing first would take away the privilege the next step needs,
-    // and the failure looks like a container that starts and produces nothing.
-    //
-    // PR_SET_KEEPCAPS is what makes the order safe: without it, moving off uid
-    // 0 clears the permitted set, and the capability pass afterwards would have
-    // nothing left to grant.
+    // The two capability passes straddle the user change, because each half
+    // only works on its own side of it. See `caps::narrow_bounding`.
+    if let Some(capabilities) = &config.process.capabilities {
+        crate::caps::narrow_bounding(capabilities)?;
+    }
+
+    // Keeps the permitted set across the uid change, so the pass below has
+    // something to raise the effective set out of.
     rustix::thread::set_keep_capabilities(true)
         .context(|| "asking to keep capabilities across the uid change".to_string())?;
     apply_user(&config.process.user)?;
 
     if let Some(capabilities) = &config.process.capabilities {
-        crate::caps::apply(capabilities)?;
+        crate::caps::apply_sets(capabilities)?;
     }
 
     rustix::process::chdir(&config.process.cwd)

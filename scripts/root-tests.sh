@@ -23,4 +23,5 @@ if [ -z "$binary" ]; then
 fi
 
 # One at a time: the mount-propagation test compares global state.
-exec sudo QUILT_TEST_ROOT=1 QUILT_TEST_ROOTFS="$PWD/rootfs" "$binary" --test-threads=1 "$@"
+exec sudo QUILT_TEST_ROOT=1 QUILT_TEST_PODMAN=1 QUILT_TEST_ROOTFS="$PWD/rootfs" \
+    "$binary" --test-threads=1 "$@"

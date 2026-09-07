@@ -529,11 +529,18 @@ fn two_containers_at_once_do_not_collide() {
 
 /// A bundle with the smallest config.json that is still a real container.
 fn write_bundle(dir: &PathBuf, args: &str) -> PathBuf {
+    write_bundle_as(dir, args, "")
+}
+
+/// `process_extra` is spliced into the process object, for the fields a
+/// particular test cares about.
+fn write_bundle_as(dir: &PathBuf, args: &str, process_extra: &str) -> PathBuf {
     std::fs::create_dir_all(dir).unwrap();
     let config = format!(
         r#"{{
             "ociVersion": "1.2.1",
             "process": {{
+                {process_extra}
                 "args": [{args}],
                 "cwd": "/",
                 "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
@@ -559,6 +566,7 @@ fn write_bundle(dir: &PathBuf, args: &str) -> PathBuf {
             }}
         }}"#,
         args = args,
+        process_extra = process_extra,
         rootfs = rootfs().display()
     );
     std::fs::write(dir.join("config.json"), config).unwrap();
@@ -669,6 +677,42 @@ fn the_lifecycle_verbs_drive_a_container_from_create_to_delete() {
 }
 
 #[test]
+fn a_container_can_run_as_a_user_other_than_root() {
+    requires_root!();
+    // Everything else here runs as uid 0, where the capability passes can be in
+    // either order and nothing notices. Moving off uid 0 empties the effective
+    // set, so a bounding-set sweep after the user change fails every drop with
+    // EPERM and the container never starts.
+    let work = std::env::temp_dir().join("quilt-oci-user");
+    std::fs::remove_dir_all(&work).ok();
+    let bundle = write_bundle_as(
+        &work.join("bundle"),
+        r#""/bin/sh", "-c", "id -u""#,
+        r#""user": {"uid": 1000, "gid": 1000},"#,
+    );
+    let state_root = work.join("state");
+    let log = work.join("stdout");
+    std::fs::create_dir_all(&state_root).unwrap();
+
+    clear_container(&state_root, "user-test");
+    create_container(&state_root, &bundle, "user-test", &log);
+    quilt_oci(&state_root, &["start", "user-test"]);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while status_of(&state_root, "user-test") != "stopped" && deadline > std::time::Instant::now()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let output = std::fs::read_to_string(&log).unwrap();
+    let errors = std::fs::read_to_string(log.with_extension("err")).unwrap_or_default();
+    quilt_oci(&state_root, &["delete", "--force", "user-test"]);
+    std::fs::remove_dir_all(&work).ok();
+
+    assert_eq!(output.trim(), "1000", "the container did not become uid 1000: {errors}");
+}
+
+#[test]
 fn a_container_that_is_still_running_is_not_deleted_without_force() {
     requires_root!();
     let work = std::env::temp_dir().join("quilt-oci-force");
@@ -716,9 +760,21 @@ fn an_unknown_container_is_an_error_not_a_panic() {
 
 /// The phase 4 demo. The three security options are the ones SPEC.md explains:
 /// seccomp is phase 5, and SELinux labelling and systemd scopes are non-goals.
+///
+/// This is the phase's headline acceptance criterion, so it is not allowed to
+/// skip itself into the green over a missing image: `scripts/root-tests.sh`
+/// sets QUILT_TEST_PODMAN=1 and this then insists on running. Anyone without a
+/// registry to pull from can leave the variable unset, and is told the
+/// criterion went unchecked.
 #[test]
 fn podman_runs_a_container_end_to_end_through_quilt() {
     requires_root!();
+    if std::env::var("QUILT_TEST_PODMAN").as_deref() != Ok("1") {
+        eprintln!(
+            "skipped: phase 4's acceptance criterion is UNVERIFIED without QUILT_TEST_PODMAN=1"
+        );
+        return;
+    }
 
     let present = Command::new("podman")
         .args(["image", "exists", "alpine"])
@@ -731,10 +787,7 @@ fn podman_runs_a_container_end_to_end_through_quilt() {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        if !pulled {
-            eprintln!("skipped: root podman has no alpine image and could not pull one");
-            return;
-        }
+        assert!(pulled, "root podman has no alpine image and could not pull one");
     }
 
     let out = Command::new("podman")

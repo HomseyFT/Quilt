@@ -119,7 +119,7 @@ pub struct Root {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Mount {
     pub destination: PathBuf,
     #[serde(rename = "type", default)]

@@ -81,11 +81,21 @@ fn mask(names: &[String]) -> Result<u64> {
     Ok(bits)
 }
 
-/// Narrows this process to the capabilities the bundle asked for.
+/// Narrows the bounding set to what the bundle asked for.
 ///
-/// The bounding set is emptied first, because removing a capability from it
-/// needs `CAP_SETPCAP`, which the second step may itself give away.
-pub fn apply(capabilities: &spec::Capabilities) -> Result<()> {
+/// This half runs *before* the process changes user, and the order is not a
+/// preference. `PR_CAPBSET_DROP` needs `CAP_SETPCAP` in the effective set, and
+/// any move off uid 0 empties the effective set outright — `PR_SET_KEEPCAPS`
+/// preserves the permitted set, not the effective one (capabilities(7)). Doing
+/// it after would fail every drop with EPERM.
+///
+/// It is also harmless to the user change that follows: the bounding set is a
+/// ceiling on what can be gained, so dropping `CAP_SETUID` and `CAP_SETGID`
+/// from it leaves the copies in effective and permitted alone, and `setgroups`
+/// still works.
+pub fn narrow_bounding(capabilities: &spec::Capabilities) -> Result<()> {
+    // Checked here because this is the first of the two passes, and refusing
+    // before anything has changed beats refusing halfway through.
     if !capabilities.ambient.is_empty() {
         return Err(Error::msg(
             "config.json asks for ambient capabilities, which quilt does not raise".to_string(),
@@ -110,6 +120,15 @@ pub fn apply(capabilities: &spec::Capabilities) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Applies the effective, permitted and inheritable sets.
+///
+/// This half runs *after* the user change, so these are the sets the workload
+/// actually keeps. Raising effective out of permitted needs no privilege of its
+/// own, which is why this half survives the transition that the other could not.
+pub fn apply_sets(capabilities: &spec::Capabilities) -> Result<()> {
     rustix::thread::set_capabilities(
         None,
         CapabilitySets {
@@ -195,11 +214,11 @@ mod tests {
     }
 
     #[test]
-    fn ambient_capabilities_are_refused() {
+    fn ambient_capabilities_are_refused_before_anything_changes() {
         let capabilities = spec::Capabilities {
             ambient: names(&["CAP_NET_RAW"]),
             ..spec::Capabilities::default()
         };
-        assert!(apply(&capabilities).is_err());
+        assert!(narrow_bounding(&capabilities).is_err());
     }
 }
