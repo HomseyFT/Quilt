@@ -19,7 +19,7 @@ work a context and a test bed.
 - Enforce resource limits through cgroups v2.
 - Apply a syscall policy written as hand-assembled classic-BPF.
 - Satisfy enough of the OCI runtime spec that `podman --runtime` drives it.
-- Do the above as an unprivileged user (phase 5).
+- Do the above as an unprivileged user (phase 6).
 
 ## Non-goals
 
@@ -46,11 +46,18 @@ Rust 1.95, edition 2024.
 No `libseccomp`, no `netlink-*` crate, no `nix`. The seccomp filter and the
 netlink messages are assembled byte by byte — that is the point.
 
+`rustix` does not cover everything either. `clone3`, `close_range` and
+`mount_setattr` are all on its `not_implemented!` list, so those are issued from
+`syscall.rs` as hand-written x86-64 syscalls. That is the same bargain as the
+rest of the table: the syscall is ours, the sequencing is ours.
+
 ## Architecture
 
 ```
 src/
   main.rs           CLI dispatch
+  error.rs          error type carrying the errno
+  syscall.rs        raw x86-64 syscalls rustix does not wrap
   spec.rs           OCI config.json types                    (phase 4)
   container.rs      lifecycle state machine, state on disk
   init.rs           the re-exec'd child: the "quilt init" process
@@ -67,7 +74,7 @@ src/
 
 ### The three seams
 
-Rootless is phase 5, but three decisions would be a rewrite if hardcoded now.
+Rootless is phase 6, but three decisions would be a rewrite if hardcoded now.
 Each is a trait from the first commit, with the root implementation written
 first and the rootless one added later behind it.
 
@@ -113,7 +120,11 @@ Each phase has a demo you can run and an acceptance test.
 - `pivot_root` with the `put_old` detach, not `chroot`
 - `/proc`, `/sys`, a minimal `/dev` (bind `null`, `zero`, `random`, `urandom`,
   `tty`), `tmpfs` on `/dev/shm`
-- Read-only bind mounts, which need the mount-then-remount two-step
+- Read-only bind mounts via `mount_setattr` with `AT_RECURSIVE`. The classic
+  mount-then-remount two-step covers only the top mount, and inside a user
+  namespace it must also carry forward every flag the kernel locked on the way
+  in or it fails with a bare EPERM. `mount_setattr` sets and clears nothing
+  else, so no locked flag is at stake, and it reaches submounts in one call
 - Hostname set in the new UTS namespace
 
 **Accepts when:** `ps aux` inside shows the shell as PID 1; `ip addr` shows only
@@ -124,15 +135,33 @@ no mount created inside is visible in the host's `/proc/self/mountinfo`.
 
 `quilt run --memory 64M --cpus 0.5 ./rootfs stress`
 
-- Create the scope, enable controllers via `cgroup.subtree_control`
-- Write `memory.max`, `cpu.max`, `pids.max`
-- Move the init process in before `execve`
+- Create the scope, enable controllers via `cgroup.subtree_control`. Two
+  structural rules shape the layout and both surface as a bare ENOENT or EBUSY:
+  a controller's files only exist in a cgroup if its parent enabled it, and a
+  cgroup holding children cannot hold processes. So `quilt/` is a pure parent
+  and `quilt/<id>` is the leaf that holds the limits and the workload
+- Write `memory.max`, `memory.swap.max`, `cpu.max`, `pids.max`. The swap ceiling
+  is not optional: without it the kernel swaps anonymous pages out to stay under
+  `memory.max` rather than OOM-killing, and on a machine with zram the memory
+  limit is then not a limit. OCI splits memory from swap, and phase 4 honours
+  that split; the bespoke `--memory` covers both
+- Birth the container inside the scope with `CLONE_INTO_CGROUP`, rather than
+  writing its pid to `cgroup.procs` afterwards. The second leaves a window in
+  which the workload runs under no limits at all, which is not hypothetical for
+  a fork bomb or a large allocation in the first milliseconds
 - Read `memory.events` to prove the limit fired
-- Clean up the scope on exit, including on the failure paths
+- Tear the scope down with `cgroup.kill`, waiting for `cgroup.events:populated`
+  to reach zero before the rmdir, on the failure paths too. `waitpid` returns
+  when pid 1 is reaped, but the rest of that pid namespace is killed and
+  reparented asynchronously, so an rmdir straight after the wait races it
+- Give each scope an id unique to the invocation. Pids recycle, and a scope left
+  behind by an earlier run would otherwise be reused by a run that asked for
+  different limits, silently inheriting the ones it did not set
 
 **Accepts when:** a process allocating past `memory.max` is OOM-killed and
 `memory.events:oom_kill` increments; `pids.max` blocks a fork bomb; the scope
-directory is gone after the container exits.
+directory is gone after the container exits, including when a child outlives
+pid 1 and when the container never started.
 
 ### Phase 3 — networking, by hand
 
@@ -186,7 +215,9 @@ Plain `podman --runtime quilt`, no sudo anywhere.
 - `SubUid` mapper via `newuidmap` / `newgidmap`
 - `Delegated` cgroup driver under `user@1000.service`
 - Idmapped mounts (`MOUNT_ATTR_IDMAP` via `mount_setattr`, kernel 6.19 has it)
-  so image files owned by uid 0 are usable without a chown pass
+  so image files owned by uid 0 are usable without a chown pass. The
+  `mount_setattr` wrapper and its `struct mount_attr` already exist from
+  phase 1, with `userns_fd` waiting to be filled in
 - Connectivity via `pasta`, which is already installed
 
 **Accepts when:** the phase-4 podman demo runs as your normal user, and

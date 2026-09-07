@@ -137,7 +137,7 @@ fn run(args: RunArgs) -> Result<i32> {
         RunSpec { rootfs, hostname: args.hostname, readonly_binds, argv: args.command, limits };
 
     // One scope per invocation. Phase 4 takes the id from the OCI caller.
-    let driver = RootCgroup::new(format!("run-{}", std::process::id()));
+    let driver = RootCgroup::new(cgroup::run_id());
     container::run(&spec, &Identity, &driver, Namespaces::DEFAULT)
 }
 

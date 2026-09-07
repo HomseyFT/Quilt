@@ -17,6 +17,7 @@
 
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::error::{Context, Error, Result};
 
@@ -28,6 +29,10 @@ const CONTROLLERS: &[&str] = &["cpu", "memory", "pids"];
 
 /// The CPU accounting period, in microseconds. `cpu.max` is a quota over this.
 const CPU_PERIOD_US: u64 = 100_000;
+
+/// How long teardown waits for a killed scope to empty before giving up.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const TEARDOWN_POLL: Duration = Duration::from_millis(1);
 
 pub trait CgroupDriver {
     fn scope(&self) -> Result<PathBuf>;
@@ -51,9 +56,20 @@ impl CgroupDriver for RootCgroup {
             .context(|| format!("creating {}", parent.display()))?;
         enable_controllers(&parent)?;
 
+        // Deliberately not create_dir_all: a directory that is already there is
+        // a scope some earlier run left behind, and its limit files are not
+        // this container's. Reusing it would silently apply them, because
+        // `Limits::files` only writes the limits that were actually asked for.
         let scope = parent.join(&self.id);
-        std::fs::create_dir_all(&scope).context(|| format!("creating {}", scope.display()))?;
-        Ok(scope)
+        match std::fs::create_dir(&scope) {
+            Ok(()) => Ok(scope),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(Error::msg(format!(
+                "{} already exists; refusing to reuse a scope whose limits are not this \
+                 container's",
+                scope.display()
+            ))),
+            Err(e) => Err(e).context(|| format!("creating {}", scope.display())),
+        }
     }
 }
 
@@ -112,6 +128,18 @@ impl Limits {
     }
 }
 
+/// A scope id unique to this invocation.
+///
+/// The pid alone is not enough. Pids recycle, and a scope a previous run left
+/// behind would then be reused by a run that asked for different limits.
+pub fn run_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or(0);
+    format!("run-{}-{nanos}", std::process::id())
+}
+
 /// A live cgroup scope. Removing it is the `Drop`, so it happens on the error
 /// paths too.
 pub struct Scope {
@@ -145,7 +173,7 @@ impl Scope {
     pub fn oom_kills(&self) -> Result<u64> {
         let events = std::fs::read_to_string(self.path.join("memory.events"))
             .context(|| format!("reading {}/memory.events", self.path.display()))?;
-        parse_memory_events(&events, "oom_kill")
+        parse_flat_key(&events, "oom_kill")
             .ok_or_else(|| Error::msg("memory.events has no oom_kill row".to_string()))
     }
 
@@ -155,12 +183,49 @@ impl Scope {
     }
 }
 
+impl Scope {
+    /// Kills whatever is left in the scope, waits for it to empty, and removes
+    /// the directory.
+    ///
+    /// `waitpid` returns as soon as pid 1 is reaped, but the kernel kills the
+    /// rest of that pid namespace asynchronously and reparents the survivors to
+    /// host init. An `rmdir` issued straight after the wait races that teardown
+    /// and loses with EBUSY, leaking the scope. `cgroup.kill` (5.14+) plus
+    /// `cgroup.events:populated` turns the race into something to wait on.
+    fn destroy(&self) -> Result<()> {
+        self.write("cgroup.kill", "1")?;
+        self.wait_until_empty()?;
+        std::fs::remove_dir(&self.path)
+            .context(|| format!("removing {}", self.path.display()))
+    }
+
+    fn wait_until_empty(&self) -> Result<()> {
+        let deadline = Instant::now() + TEARDOWN_TIMEOUT;
+        loop {
+            let events = std::fs::read_to_string(self.path.join("cgroup.events"))
+                .context(|| format!("reading {}/cgroup.events", self.path.display()))?;
+
+            if parse_flat_key(&events, "populated") == Some(0) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::msg(format!(
+                    "{} still had processes {TEARDOWN_TIMEOUT:?} after cgroup.kill",
+                    self.path.display()
+                )));
+            }
+            std::thread::sleep(TEARDOWN_POLL);
+        }
+    }
+}
+
 impl Drop for Scope {
     fn drop(&mut self) {
-        // Best effort. The workload has been reaped by the time this runs, so
-        // the only way it fails is a straggler the runtime does not own, and
-        // there is nothing useful to say about that from a destructor.
-        let _ = std::fs::remove_dir(&self.path);
+        // A destructor cannot return an error, but a leaked scope is worth
+        // saying out loud rather than discarding.
+        if let Err(e) = self.destroy() {
+            eprintln!("quilt: {e}");
+        }
     }
 }
 
@@ -193,8 +258,9 @@ pub fn parse_size(value: &str) -> Result<u64> {
         .ok_or_else(|| Error::msg(format!("size {value:?} overflows")))
 }
 
-/// Reads one counter out of a flat `key value` cgroup file.
-fn parse_memory_events(contents: &str, key: &str) -> Option<u64> {
+/// Reads one value out of a flat `key value` cgroup file, as used by
+/// `memory.events` and `cgroup.events`.
+fn parse_flat_key(contents: &str, key: &str) -> Option<u64> {
     contents.lines().find_map(|line| {
         let (name, value) = line.split_once(' ')?;
         (name == key).then(|| value.trim().parse().ok())?
@@ -248,21 +314,21 @@ mod tests {
     #[test]
     fn oom_kills_are_read_out_of_memory_events() {
         let events = "low 0\nhigh 0\nmax 3\noom 1\noom_kill 2\noom_group_kill 0\n";
-        assert_eq!(parse_memory_events(events, "oom_kill"), Some(2));
-        assert_eq!(parse_memory_events(events, "max"), Some(3));
+        assert_eq!(parse_flat_key(events, "oom_kill"), Some(2));
+        assert_eq!(parse_flat_key(events, "max"), Some(3));
     }
 
     #[test]
     fn a_missing_counter_is_none_rather_than_zero() {
-        assert_eq!(parse_memory_events("low 0\nhigh 0\n", "oom_kill"), None);
+        assert_eq!(parse_flat_key("low 0\nhigh 0\n", "oom_kill"), None);
     }
 
     #[test]
     fn oom_kill_is_not_confused_with_oom_group_kill() {
         // A prefix match would read the wrong row for either of these.
         let events = "oom_group_kill 7\noom_kill 1\n";
-        assert_eq!(parse_memory_events(events, "oom_kill"), Some(1));
-        assert_eq!(parse_memory_events(events, "oom_group_kill"), Some(7));
+        assert_eq!(parse_flat_key(events, "oom_kill"), Some(1));
+        assert_eq!(parse_flat_key(events, "oom_group_kill"), Some(7));
     }
 
     #[test]
@@ -284,6 +350,21 @@ mod tests {
         let limits = Limits { memory: Some(1024), cpus: Some(0.5), pids: Some(32) };
         let names: Vec<&str> = limits.files().unwrap().iter().map(|(f, _)| *f).collect();
         assert_eq!(names, ["memory.max", "memory.swap.max", "cpu.max", "pids.max"]);
+    }
+
+    #[test]
+    fn cgroup_events_is_read_by_the_same_parser() {
+        assert_eq!(parse_flat_key("populated 1\nfrozen 0\n", "populated"), Some(1));
+        assert_eq!(parse_flat_key("populated 0\nfrozen 0\n", "populated"), Some(0));
+    }
+
+    #[test]
+    fn a_run_id_is_not_just_the_pid() {
+        // Two runs a moment apart must not land on the same scope, or the
+        // second inherits the first's limit files.
+        let (first, second) = (run_id(), run_id());
+        assert_ne!(first, second);
+        assert!(first.starts_with(&format!("run-{}-", std::process::id())));
     }
 
     #[test]

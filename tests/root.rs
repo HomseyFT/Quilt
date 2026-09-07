@@ -365,6 +365,19 @@ fn the_scope_is_gone_once_the_container_exits() {
 }
 
 #[test]
+fn a_straggler_outliving_pid_one_does_not_leak_the_scope() {
+    requires_root!();
+    // pid 1 exits at once while a child is still running. waitpid returns as
+    // soon as pid 1 is reaped, so the rest of the namespace is still being
+    // killed and reparented when the scope is torn down. Without cgroup.kill
+    // and the populated wait, the rmdir loses that race with EBUSY.
+    assert!(quilt(&[], "sleep 100 & exit 0").status.success());
+
+    let leftover = scopes();
+    assert!(leftover.is_empty(), "a straggler left the scope behind: {leftover:?}");
+}
+
+#[test]
 fn a_scope_is_removed_even_when_the_container_fails_to_start() {
     requires_root!();
     // The workload does not exist, so init fails after the scope was created.
