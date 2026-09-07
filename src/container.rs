@@ -5,11 +5,12 @@
 //! which is the two of them back to back.
 
 use std::ffi::CString;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::PathBuf;
 
 use rustix::process::{Pid, Signal, WaitOptions};
 
+use crate::cgroup::{CgroupDriver, Limits, Scope};
 use crate::error::{Context, Error, Result};
 use crate::idmap::IdMapper;
 use crate::mount::BindSpec;
@@ -22,6 +23,7 @@ pub struct RunSpec {
     pub readonly_binds: Vec<BindSpec>,
     /// The workload and its arguments.
     pub argv: Vec<String>,
+    pub limits: Limits,
 }
 
 /// Exit code used when the init process could not be reached or execed. 127 is
@@ -29,7 +31,22 @@ pub struct RunSpec {
 const EXIT_INIT_FAILED: i32 = 127;
 const EXIT_EXEC_FAILED: i32 = 126;
 
-pub fn run(spec: &RunSpec, mapper: &dyn IdMapper, namespaces: Namespaces) -> Result<i32> {
+pub fn run(
+    spec: &RunSpec,
+    mapper: &dyn IdMapper,
+    driver: &dyn CgroupDriver,
+    namespaces: Namespaces,
+) -> Result<i32> {
+    // The scope exists before the workload does, and `Scope`'s `Drop` removes
+    // it on every path out of this function, including the error ones.
+    //
+    // The clone below copies this guard into the child, but every path the
+    // child takes ends in `execve` or `exit_group`, neither of which unwinds,
+    // so the child never runs the destructor and never deletes the scope.
+    let scope = Scope::create(driver)?;
+    scope.apply(&spec.limits)?;
+    let scope_fd = scope.open()?;
+
     // Everything the child touches between `clone3` and `execve` is built here,
     // while allocation is still safe.
     let exe = CString::new("/proc/self/exe").expect("no interior NUL");
@@ -42,7 +59,7 @@ pub fn run(spec: &RunSpec, mapper: &dyn IdMapper, namespaces: Namespaces) -> Res
     let (map_wait, map_done) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
         .context(|| "creating the id-map sync pipe".to_string())?;
 
-    let args = CloneArgs::new(namespaces.clone_flags());
+    let args = CloneArgs::new(namespaces.clone_flags()).into_cgroup(scope_fd.as_fd());
 
     // SAFETY: `args.stack` is zero, so this is a fork. The child arm below does
     // nothing but close a descriptor, read one byte and `execve`.
@@ -81,7 +98,10 @@ pub fn run(spec: &RunSpec, mapper: &dyn IdMapper, namespaces: Namespaces) -> Res
                 return Err(e);
             }
             drop(map_done);
-            wait_for_exit(child)
+
+            let code = wait_for_exit(child)?;
+            report_oom_kills(&scope, &spec.limits);
+            Ok(code)
         }
     }
 }
@@ -169,6 +189,22 @@ fn wait_for_exit(child: Pid) -> Result<i32> {
     }
 }
 
+/// Says so when the kernel OOM-killed something in the scope, which otherwise
+/// reaches the caller only as an unexplained 137.
+///
+/// Read before the scope is removed, and only when a memory limit was set —
+/// without the memory controller there is no `memory.events` to read.
+fn report_oom_kills(scope: &Scope, limits: &Limits) {
+    if limits.memory.is_none() {
+        return;
+    }
+    match scope.oom_kills() {
+        Ok(0) => {}
+        Ok(kills) => eprintln!("quilt: memory limit exceeded, memory.events oom_kill={kills}"),
+        Err(e) => eprintln!("quilt: could not read memory.events: {e}"),
+    }
+}
+
 /// A container's exit code, or `None` if it has not reached a terminal state.
 ///
 /// A process killed by a signal has no exit status of its own, so quilt reports
@@ -195,6 +231,7 @@ mod tests {
                 destination: PathBuf::from("/etc/hosts"),
             }],
             argv: vec!["/bin/sh".into(), "-c".into(), "echo hi".into()],
+            limits: Limits::default(),
         }
     }
 

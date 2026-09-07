@@ -3,7 +3,8 @@
 A Linux container runtime in Rust. See [SPEC.md](SPEC.md) for what it is and
 where it is going.
 
-Phase 1 is done: namespaces, mount setup and `pivot_root`.
+Phases 1 and 2 are done: namespaces, mount setup, `pivot_root`, and cgroup v2
+limits.
 
 ## Build
 
@@ -24,8 +25,13 @@ Root is required until phase 6: the identity id-map needs `CAP_SETUID` in the
 parent user namespace.
 
 ```
-quilt run [--hostname NAME] [--ro SRC[:DST]]... <ROOTFS> <COMMAND>...
+quilt run [--hostname NAME] [--ro SRC[:DST]]...
+          [--memory SIZE] [--cpus N] [--pids N]
+          <ROOTFS> <COMMAND>...
 ```
+
+`--memory` covers swap as well as memory, so the ceiling cannot be escaped by
+swapping. The OCI spec separates the two, and phase 4 honours that split.
 
 ## Test
 

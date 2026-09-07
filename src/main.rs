@@ -1,3 +1,4 @@
+mod cgroup;
 mod container;
 mod error;
 mod idmap;
@@ -10,6 +11,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::cgroup::{Limits, RootCgroup};
 use crate::container::RunSpec;
 use crate::error::{Context, Error, Result};
 use crate::idmap::Identity;
@@ -43,6 +45,18 @@ struct RunArgs {
     /// Bind a host path into the container read-only, as SRC or SRC:DST.
     #[arg(long = "ro", value_name = "SRC[:DST]")]
     readonly: Vec<String>,
+
+    /// Memory ceiling, as 64M, 512K or a plain byte count.
+    #[arg(long, value_name = "SIZE")]
+    memory: Option<String>,
+
+    /// CPU share, where 0.5 is half of one core.
+    #[arg(long, value_name = "N")]
+    cpus: Option<f64>,
+
+    /// Maximum number of processes.
+    #[arg(long, value_name = "N")]
+    pids: Option<u64>,
 
     /// The command to run, and its arguments.
     #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
@@ -109,8 +123,22 @@ fn run(args: RunArgs) -> Result<i32> {
         .map(|value| readonly_bind(value))
         .collect::<Result<Vec<_>>>()?;
 
-    let spec = RunSpec { rootfs, hostname: args.hostname, readonly_binds, argv: args.command };
-    container::run(&spec, &Identity, Namespaces::DEFAULT)
+    let limits = Limits {
+        memory: args.memory.as_deref().map(cgroup::parse_size).transpose()?,
+        cpus: args.cpus,
+        pids: args.pids,
+    };
+    // Validated here so a bad --cpus fails before a container is built.
+    if let Some(cpus) = limits.cpus {
+        cgroup::cpu_max(cpus)?;
+    }
+
+    let spec =
+        RunSpec { rootfs, hostname: args.hostname, readonly_binds, argv: args.command, limits };
+
+    // One scope per invocation. Phase 4 takes the id from the OCI caller.
+    let driver = RootCgroup::new(format!("run-{}", std::process::id()));
+    container::run(&spec, &Identity, &driver, Namespaces::DEFAULT)
 }
 
 /// `SRC` mounts at the same path inside; `SRC:DST` mounts at `DST`. The pair is

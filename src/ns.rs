@@ -7,6 +7,7 @@
 use crate::error::{Context, Error, Result};
 use crate::syscall;
 use rustix::process::Pid;
+use std::os::fd::{AsRawFd, BorrowedFd};
 
 pub const CLONE_NEWNS: u64 = 0x0002_0000;
 pub const CLONE_NEWCGROUP: u64 = 0x0200_0000;
@@ -15,6 +16,9 @@ pub const CLONE_NEWIPC: u64 = 0x0800_0000;
 pub const CLONE_NEWUSER: u64 = 0x1000_0000;
 pub const CLONE_NEWPID: u64 = 0x2000_0000;
 pub const CLONE_NEWNET: u64 = 0x4000_0000;
+/// Births the child directly inside a cgroup named by a descriptor, rather than
+/// writing its pid to `cgroup.procs` after the fact.
+pub const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 
 const SIGCHLD: u64 = 17;
 
@@ -97,6 +101,21 @@ impl CloneArgs {
     pub fn new(flags: u64) -> Self {
         Self { flags, exit_signal: SIGCHLD, ..Self::default() }
     }
+
+    /// Puts the child in `cgroup` at birth.
+    ///
+    /// The alternative — clone, then write the child's pid to `cgroup.procs` —
+    /// leaves a window in which the workload is running under no limits at all.
+    /// That window is not hypothetical for a fork bomb or a large allocation in
+    /// the first milliseconds.
+    ///
+    /// This is why `CloneArgs` is `CLONE_ARGS_SIZE_VER2`: 88 bytes is exactly
+    /// the version that added the `cgroup` member.
+    pub fn into_cgroup(mut self, cgroup: BorrowedFd<'_>) -> Self {
+        self.flags |= CLONE_INTO_CGROUP;
+        self.cgroup = cgroup.as_raw_fd() as u64;
+        self
+    }
 }
 
 pub enum Fork {
@@ -172,6 +191,23 @@ mod tests {
     fn clone_args_matches_clone_args_size_ver2() {
         assert_eq!(size_of::<CloneArgs>(), 88);
         assert_eq!(align_of::<CloneArgs>(), 8);
+    }
+
+    #[test]
+    fn a_scope_descriptor_sets_the_flag_and_the_cgroup_member() {
+        // SAFETY: the fd is never used, only recorded in the struct.
+        let fd = unsafe { BorrowedFd::borrow_raw(7) };
+        let args = CloneArgs::new(CLONE_NEWPID).into_cgroup(fd);
+
+        assert_eq!(args.cgroup, 7);
+        assert_eq!(args.flags, CLONE_NEWPID | CLONE_INTO_CGROUP);
+    }
+
+    #[test]
+    fn without_a_scope_the_cgroup_member_stays_zero() {
+        let args = CloneArgs::new(CLONE_NEWPID);
+        assert_eq!(args.cgroup, 0);
+        assert_eq!(args.flags & CLONE_INTO_CGROUP, 0);
     }
 
     #[test]
