@@ -195,11 +195,41 @@ Out of the OCI path on purpose — this hangs off the bespoke CLI only.
   twice, so this takes the same bargain phase 6 takes with `newuidmap`: shell
   out to the tool that owns the interface
 
-**Accepts when:** the encoder's output is byte-identical to what `ip link add`
-puts on the wire (captured with `nlmon` by `scripts/capture-netlink.sh`, stored
-under `tests/golden/`, compared with the sequence number and port id zeroed
-since those are per-socket bookkeeping rather than part of the request), and the
-container reaches the internet.
+**Accepts when:** the container reaches the internet, and the encoder agrees
+with what `ip` puts on the wire — captured with `nlmon` by
+`scripts/capture-netlink.sh` and stored under `tests/golden/`.
+
+The bar is split, because "byte-identical to `ip`" turns out to be the wrong
+target for most messages. Several differences between two encodings are
+semantically invisible: attribute order, which the kernel parses into a table;
+a trailing NUL, which `nla_strcmp` strips before comparing; and identifying a
+link by `ifi_index` rather than by `IFLA_IFNAME`. Pinning those would encode
+iproute2's style into this suite and break on its next release, without ever
+catching a bug.
+
+- **Byte-identical** for the veth creation message. It is the deepest nest in
+  the project and the place an encoding bug would actually live, so it is worth
+  matching exactly. Two divergences found this way were real and are fixed:
+  `IFLA_INFO_KIND` goes on the wire without a terminator while `IFLA_IFNAME`
+  goes with one — the convention is per attribute, not per protocol — and the
+  namespace attribute precedes the name inside `VETH_INFO_PEER`.
+- **Structural** for the rest: decode both sides and compare message type,
+  flags, the fixed struct, and the attribute tree as a set with string
+  terminators normalised. That is what the kernel reads.
+- **Directly pinned** for the one thing no capture can cover. `ip`'s `netns`
+  argument resolves to an open descriptor and goes out as `IFLA_NET_NS_FD`;
+  quilt holds the child's pid and sends `IFLA_NET_NS_PID`. No invocation of
+  `ip` produces quilt's shape, so a unit test asserts those eight bytes instead
+  and the capture is taken without a netns.
+
+Sequence number and port id are zeroed on both sides throughout: they are
+per-socket bookkeeping rather than part of the request.
+
+Capturing is not as simple as it sounds, and the trap is worth recording: an
+`nlmon` interface taps every netlink conversation on the machine, not just this
+one. Scanning a captured packet for a plausible `nlmsghdr` will happily find a
+false positive inside an unrelated nftables message and write it out as truth.
+The extractor filters on the interface name carried inside the message.
 
 The bridge and the nftables table outlive containers on purpose — they are
 shared fabric, and tearing them down would cut off whatever else is still

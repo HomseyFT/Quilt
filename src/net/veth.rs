@@ -148,7 +148,7 @@ fn create_bridge_message() -> Message {
         netlink::NLM_F_REQUEST | netlink::NLM_F_ACK | netlink::NLM_F_CREATE | netlink::NLM_F_EXCL,
     );
     message.payload(&netlink::ifinfomsg(netlink::AF_UNSPEC, 0, 0, 0));
-    message.attr_str(netlink::IFLA_IFNAME, BRIDGE);
+    message.attr_nul_str(netlink::IFLA_IFNAME, BRIDGE);
     let link_info = message.nest(netlink::IFLA_LINKINFO);
     message.attr_str(netlink::IFLA_INFO_KIND, "bridge");
     message.end(link_info);
@@ -209,7 +209,7 @@ fn delete_link(name: &str) -> Result<()> {
     let mut message =
         Message::new(netlink::RTM_DELLINK, netlink::NLM_F_REQUEST | netlink::NLM_F_ACK);
     message.payload(&netlink::ifinfomsg(netlink::AF_UNSPEC, 0, 0, 0));
-    message.attr_str(netlink::IFLA_IFNAME, name);
+    message.attr_nul_str(netlink::IFLA_IFNAME, name);
     // Already gone is the desired state: the peer dying takes this end with it.
     socket.request_tolerating(message, &format!("deleting {name}"), rustix::io::Errno::NODEV)
 }
@@ -306,25 +306,35 @@ fn masquerade_ruleset() -> String {
 /// container's netns, so it is never visible on the host and cannot collide
 /// with a host interface already called eth0.
 fn create_veth(socket: &mut Socket, host_name: &str, pid: Pid) -> Result<()> {
-    let message = create_veth_message(host_name, pid.as_raw_nonzero().get() as u32);
+    let message = create_veth_message(host_name, Some(pid.as_raw_nonzero().get() as u32));
     socket.request(message, "creating the veth pair")
 }
 
-fn create_veth_message(host_name: &str, peer_pid: u32) -> Message {
+/// `peer_pid` of `None` leaves both ends on the host. Nothing in the runtime
+/// wants that, but it is the shape `ip link add ... type veth peer name ...`
+/// produces, which is what the golden capture can be compared against:
+/// `ip`'s `netns` argument resolves to an open descriptor and goes out as
+/// `IFLA_NET_NS_FD`, and quilt has a pid rather than a descriptor.
+fn create_veth_message(host_name: &str, peer_pid: Option<u32>) -> Message {
     let mut message = Message::new(
         netlink::RTM_NEWLINK,
         netlink::NLM_F_REQUEST | netlink::NLM_F_ACK | netlink::NLM_F_CREATE | netlink::NLM_F_EXCL,
     );
     message.payload(&netlink::ifinfomsg(netlink::AF_UNSPEC, 0, 0, 0));
-    message.attr_str(netlink::IFLA_IFNAME, host_name);
+    message.attr_nul_str(netlink::IFLA_IFNAME, host_name);
 
     let link_info = message.nest(netlink::IFLA_LINKINFO);
     message.attr_str(netlink::IFLA_INFO_KIND, "veth");
     let info_data = message.nest(netlink::IFLA_INFO_DATA);
     let peer = message.nest(netlink::VETH_INFO_PEER);
     message.payload(&netlink::ifinfomsg(netlink::AF_UNSPEC, 0, 0, 0));
-    message.attr_str(netlink::IFLA_IFNAME, CONTAINER_LINK);
-    message.attr_u32(netlink::IFLA_NET_NS_PID, peer_pid);
+    // The namespace attribute goes before the name, which is the order `ip`
+    // uses. The kernel parses attributes into a table and does not care, but
+    // matching it keeps the capture comparison about substance.
+    if let Some(pid) = peer_pid {
+        message.attr_u32(netlink::IFLA_NET_NS_PID, pid);
+    }
+    message.attr_nul_str(netlink::IFLA_IFNAME, CONTAINER_LINK);
     message.end(peer);
     message.end(info_data);
     message.end(link_info);
@@ -340,7 +350,7 @@ fn enslave_message(name: &str, bridge: u32) -> Message {
     let mut message =
         Message::new(netlink::RTM_SETLINK, netlink::NLM_F_REQUEST | netlink::NLM_F_ACK);
     message.payload(&netlink::ifinfomsg(netlink::AF_UNSPEC, 0, 0, 0));
-    message.attr_str(netlink::IFLA_IFNAME, name);
+    message.attr_nul_str(netlink::IFLA_IFNAME, name);
     message.attr_u32(netlink::IFLA_MASTER, bridge);
     message
 }
@@ -391,6 +401,7 @@ fn default_route_message(index: u32, gateway: Ipv4Addr) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn a_host_link_name_fits_in_ifnamsiz() {
@@ -441,20 +452,103 @@ mod tests {
         assert_eq!(message.finish(0), golden(name), "{name} diverges from what ip sends");
     }
 
+    /// The veth request is the deepest nest in the project and the place an
+    /// encoder bug would actually live, so it is held to byte equality.
     #[test]
-    fn the_bridge_message_matches_what_ip_sends() {
-        assert_matches_ip("bridge-add.hex", create_bridge_message());
+    fn the_veth_message_is_byte_identical_to_what_ip_sends() {
+        // Must match the invocation in scripts/capture-netlink.sh, which
+        // creates the pair without a netns for the reason on
+        // `create_veth_message`.
+        assert_matches_ip("veth-add.hex", create_veth_message("qvgolden", None));
+    }
+
+    /// The netns move is the one part of the veth request no capture can cover,
+    /// so its bytes are pinned directly.
+    #[test]
+    fn moving_the_peer_adds_exactly_the_net_ns_pid_attribute() {
+        let without = create_veth_message("qvgolden", None).finish(0);
+        let with = create_veth_message("qvgolden", Some(4242)).finish(0);
+
+        assert_eq!(with.len(), without.len() + 8);
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&8u16.to_ne_bytes());
+        expected.extend_from_slice(&netlink::IFLA_NET_NS_PID.to_ne_bytes());
+        expected.extend_from_slice(&4242u32.to_ne_bytes());
+        assert!(
+            with.windows(8).any(|w| w == expected),
+            "the IFLA_NET_NS_PID attribute is not on the wire"
+        );
+        assert!(!without.windows(8).any(|w| w == expected));
+    }
+
+    /// Everything else is compared for what the kernel reads rather than
+    /// byte-for-byte, so iproute2's stylistic choices do not end up pinned in
+    /// this suite.
+    #[test]
+    fn the_bridge_message_asks_for_the_same_thing_ip_asks_for() {
+        let theirs =
+            netlink::parse(&golden("bridge-add.hex"), 16, &[netlink::IFLA_LINKINFO]).unwrap();
+        let ours = netlink::parse(
+            &create_bridge_message().finish(0),
+            16,
+            &[netlink::IFLA_LINKINFO],
+        )
+        .unwrap();
+
+        assert_eq!(ours.kind, theirs.kind);
+        assert_eq!(ours.flags, theirs.flags);
+        assert_eq!(ours.payload, theirs.payload);
+        assert_eq!(attribute_set(&ours.attrs), attribute_set(&theirs.attrs));
     }
 
     #[test]
-    fn the_veth_message_matches_what_ip_sends() {
-        // Must match the invocation in scripts/capture-netlink.sh.
-        assert_matches_ip("veth-add.hex", create_veth_message("qvgolden", 1));
+    fn the_set_up_message_asks_for_the_same_thing_ip_asks_for() {
+        let theirs = netlink::parse(&golden("link-up.hex"), 16, &[]).unwrap();
+        let ours = netlink::parse(&set_up_message("qvgolden").finish(0), 16, &[]).unwrap();
+
+        assert_eq!(ours.kind, theirs.kind, "both are RTM_SETLINK");
+        // ifi_flags and ifi_change, the last two words of ifinfomsg: which bits
+        // are being set, and which of them this message is authoritative for.
+        assert_eq!(ours.payload[8..16], theirs.payload[8..16]);
+
+        // The accepted divergence, asserted rather than glossed over: iproute2
+        // resolves the name to an index before sending and identifies the link
+        // by ifi_index, while quilt sends ifi_index 0 and IFLA_IFNAME. The
+        // kernel takes either.
+        assert_ne!(theirs.payload[4..8], [0, 0, 0, 0], "ip identifies by index");
+        assert_eq!(ours.payload[4..8], [0, 0, 0, 0]);
+        assert!(
+            ours.attrs.iter().any(|a| matches!(
+                a,
+                netlink::Attr::Value { kind: netlink::IFLA_IFNAME, .. }
+            )),
+            "quilt identifies by name"
+        );
     }
 
-    #[test]
-    fn the_set_up_message_matches_what_ip_sends() {
-        assert_matches_ip("link-up.hex", set_up_message("qvgolden"));
+    /// Attributes as a set, with the trailing NUL stripped off the string ones.
+    /// Order is not meaningful — the kernel parses them into a table — and the
+    /// NUL is stripped by `nla_strcmp` before anything compares it.
+    fn attribute_set(attrs: &[netlink::Attr]) -> BTreeSet<netlink::Attr> {
+        const STRINGS: &[u16] = &[netlink::IFLA_IFNAME, netlink::IFLA_INFO_KIND];
+
+        attrs
+            .iter()
+            .map(|attr| match attr {
+                netlink::Attr::Value { kind, value } if STRINGS.contains(kind) => {
+                    netlink::Attr::Value {
+                        kind: *kind,
+                        value: value.strip_suffix(b"\0").unwrap_or(value).to_vec(),
+                    }
+                }
+                netlink::Attr::Nest { kind, attrs } => netlink::Attr::Nest {
+                    kind: *kind,
+                    attrs: attribute_set(attrs).into_iter().collect(),
+                },
+                other => other.clone(),
+            })
+            .collect()
     }
 
     #[test]

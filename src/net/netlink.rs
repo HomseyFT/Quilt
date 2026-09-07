@@ -100,8 +100,19 @@ impl Message {
         self
     }
 
-    /// Interface names go on the wire NUL-terminated.
+    /// A string attribute, without a terminator.
+    ///
+    /// Whether a string is NUL-terminated is decided per attribute, not once
+    /// for netlink: the kernel's `nla_strcmp` strips a trailing NUL before
+    /// comparing, so both forms work, but they are different bytes. Captures of
+    /// `ip` show `IFLA_INFO_KIND` sent bare and `IFLA_IFNAME` sent terminated,
+    /// so quilt matches that. See [`Message::attr_nul_str`].
     pub fn attr_str(&mut self, kind: u16, value: &str) -> &mut Self {
+        self.attr(kind, value.as_bytes())
+    }
+
+    /// A string attribute with the trailing NUL, as interface names go.
+    pub fn attr_nul_str(&mut self, kind: u16, value: &str) -> &mut Self {
         let mut bytes = Vec::with_capacity(value.len() + 1);
         bytes.extend_from_slice(value.as_bytes());
         bytes.push(0);
@@ -213,6 +224,72 @@ fn find_ack(buf: &[u8], seq: u32) -> Ack {
     Ack::Absent
 }
 
+/// One attribute, decoded.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Attr {
+    Value { kind: u16, value: Vec<u8> },
+    Nest { kind: u16, attrs: Vec<Attr> },
+}
+
+/// A decoded request.
+///
+/// Used to compare two encodings of the same intent where they are allowed to
+/// differ in style — attribute order, or a NUL that the kernel strips anyway.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Parsed {
+    pub kind: u16,
+    pub flags: u16,
+    /// The fixed struct after the header, still as bytes.
+    pub payload: Vec<u8>,
+    pub attrs: Vec<Attr>,
+}
+
+/// Decodes a request. `payload_len` is the size of the fixed struct for this
+/// message type, and `nested` names the attribute types whose values are
+/// themselves attribute lists.
+#[cfg(test)]
+pub fn parse(bytes: &[u8], payload_len: usize, nested: &[u16]) -> Result<Parsed> {
+    if bytes.len() < NLMSGHDR_LEN + payload_len {
+        return Err(Error::msg("netlink message is shorter than its fixed payload".to_string()));
+    }
+    let len = u32::from_ne_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    if len < NLMSGHDR_LEN + payload_len || len > bytes.len() {
+        return Err(Error::msg(format!("nlmsg_len {len} does not fit {} bytes", bytes.len())));
+    }
+
+    Ok(Parsed {
+        kind: u16::from_ne_bytes(bytes[4..6].try_into().unwrap()),
+        flags: u16::from_ne_bytes(bytes[6..8].try_into().unwrap()),
+        payload: bytes[NLMSGHDR_LEN..NLMSGHDR_LEN + payload_len].to_vec(),
+        attrs: parse_attrs(&bytes[NLMSGHDR_LEN + payload_len..len], nested)?,
+    })
+}
+
+#[cfg(test)]
+fn parse_attrs(bytes: &[u8], nested: &[u16]) -> Result<Vec<Attr>> {
+    let mut out = Vec::new();
+    let mut offset = 0;
+
+    while offset + RTATTR_LEN <= bytes.len() {
+        let len = u16::from_ne_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+        let kind = u16::from_ne_bytes(bytes[offset + 2..offset + 4].try_into().unwrap());
+        if len < RTATTR_LEN || offset + len > bytes.len() {
+            return Err(Error::msg(format!("attribute {kind} claims {len} bytes it does not have")));
+        }
+
+        let value = &bytes[offset + RTATTR_LEN..offset + len];
+        out.push(if nested.contains(&kind) {
+            Attr::Nest { kind, attrs: parse_attrs(value, nested)? }
+        } else {
+            Attr::Value { kind, value: value.to_vec() }
+        });
+        offset += align(len);
+    }
+    Ok(out)
+}
+
 /// A `NETLINK_ROUTE` socket, bound to whichever netns the caller is in.
 pub struct Socket {
     fd: OwnedFd,
@@ -280,6 +357,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_bare_string_attribute_carries_no_terminator() {
+        let mut message = Message::new(RTM_NEWLINK, NLM_F_REQUEST);
+        message.attr_str(IFLA_INFO_KIND, "veth");
+        let bytes = message.finish(1);
+
+        // 4 header bytes plus "veth" is 8, which needs no padding.
+        assert_eq!(u16::from_ne_bytes(bytes[16..18].try_into().unwrap()), 8);
+        assert_eq!(&bytes[20..24], b"veth");
+        assert_eq!(bytes.len(), 24);
+    }
+
+    #[test]
+    fn parsing_round_trips_what_the_encoder_built() {
+        let mut message = Message::new(RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK);
+        message.payload(&ifinfomsg(AF_UNSPEC, 0, 0, 0));
+        message.attr_nul_str(IFLA_IFNAME, "quilt0");
+        let link_info = message.nest(IFLA_LINKINFO);
+        message.attr_str(IFLA_INFO_KIND, "bridge");
+        message.end(link_info);
+
+        let parsed = parse(&message.finish(1), 16, &[IFLA_LINKINFO]).unwrap();
+
+        assert_eq!(parsed.kind, RTM_NEWLINK);
+        assert_eq!(parsed.flags, NLM_F_REQUEST | NLM_F_ACK);
+        assert_eq!(parsed.payload, vec![0u8; 16]);
+        assert_eq!(
+            parsed.attrs,
+            vec![
+                Attr::Value { kind: IFLA_IFNAME, value: b"quilt0\0".to_vec() },
+                Attr::Nest {
+                    kind: IFLA_LINKINFO,
+                    attrs: vec![Attr::Value { kind: IFLA_INFO_KIND, value: b"bridge".to_vec() }],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parsing_rejects_an_attribute_that_overruns_the_message() {
+        let mut bytes = Message::new(RTM_NEWLINK, NLM_F_REQUEST).finish(1);
+        bytes.extend_from_slice(&[0xff, 0xff, 0x03, 0x00]);
+        let len = bytes.len() as u32;
+        bytes[0..4].copy_from_slice(&len.to_ne_bytes());
+        assert!(parse(&bytes, 0, &[]).is_err());
+    }
+
+    #[test]
     fn alignment_rounds_up_to_four() {
         assert_eq!(align(0), 0);
         assert_eq!(align(1), 4);
@@ -303,7 +427,7 @@ mod tests {
     #[test]
     fn a_string_attribute_is_nul_terminated_and_padded() {
         let mut message = Message::new(RTM_NEWLINK, NLM_F_REQUEST);
-        message.attr_str(IFLA_IFNAME, "eth0");
+        message.attr_nul_str(IFLA_IFNAME, "eth0");
         let bytes = message.finish(1);
 
         let attr = &bytes[NLMSGHDR_LEN..];
@@ -335,11 +459,11 @@ mod tests {
         let bytes = message.finish(1);
 
         let nest = &bytes[NLMSGHDR_LEN..];
-        // 4 nest header + (4 + "veth\0" = 9, padded to 12) = 16.
-        assert_eq!(u16::from_ne_bytes(nest[0..2].try_into().unwrap()), 16);
+        // 4 nest header + (4 + "veth" = 8, already aligned) = 12.
+        assert_eq!(u16::from_ne_bytes(nest[0..2].try_into().unwrap()), 12);
         assert_eq!(u16::from_ne_bytes(nest[2..4].try_into().unwrap()), IFLA_LINKINFO);
-        assert_eq!(u16::from_ne_bytes(nest[4..6].try_into().unwrap()), 9);
-        assert_eq!(&nest[8..13], b"veth\0");
+        assert_eq!(u16::from_ne_bytes(nest[4..6].try_into().unwrap()), 8);
+        assert_eq!(&nest[8..12], b"veth");
     }
 
     #[test]
@@ -350,7 +474,7 @@ mod tests {
         let info_data = message.nest(IFLA_INFO_DATA);
         let peer = message.nest(VETH_INFO_PEER);
         message.payload(&ifinfomsg(AF_UNSPEC, 0, 0, 0));
-        message.attr_str(IFLA_IFNAME, "eth0");
+        message.attr_nul_str(IFLA_IFNAME, "eth0");
         message.end(peer);
         message.end(info_data);
         message.end(link_info);
@@ -360,14 +484,14 @@ mod tests {
         let outer_len = u16::from_ne_bytes(outer[0..2].try_into().unwrap()) as usize;
         assert_eq!(outer_len, outer.len(), "the outer nest spans the rest of the message");
 
-        // IFLA_INFO_KIND takes 12 bytes after the 4-byte outer header.
-        let data = &outer[16..];
+        // IFLA_INFO_KIND takes 8 bytes after the 4-byte outer header.
+        let data = &outer[12..];
         let data_len = u16::from_ne_bytes(data[0..2].try_into().unwrap()) as usize;
         assert_eq!(u16::from_ne_bytes(data[2..4].try_into().unwrap()), IFLA_INFO_DATA);
 
         let peer = &data[4..data_len];
         assert_eq!(u16::from_ne_bytes(peer[2..4].try_into().unwrap()), VETH_INFO_PEER);
-        // 4 peer header + 16 ifinfomsg + 12 name attribute.
+        // 4 peer header + 16 ifinfomsg + 12 for the NUL-terminated name.
         assert_eq!(u16::from_ne_bytes(peer[0..2].try_into().unwrap()), 32);
     }
 
