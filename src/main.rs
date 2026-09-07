@@ -6,6 +6,7 @@ mod init;
 mod mount;
 mod net;
 mod ns;
+mod spec;
 mod syscall;
 
 use std::path::PathBuf;

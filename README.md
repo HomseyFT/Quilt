@@ -4,7 +4,8 @@ A Linux container runtime in Rust. See [SPEC.md](SPEC.md) for what it is and
 where it is going.
 
 Phases 1 to 3 are done: namespaces, mount setup, `pivot_root`, cgroup v2 limits,
-and hand-assembled rtnetlink for veth networking.
+and hand-assembled rtnetlink for veth networking. Phase 4, the OCI runtime spec,
+is in progress.
 
 ## Build
 

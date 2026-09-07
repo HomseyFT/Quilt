@@ -32,6 +32,8 @@ interfaces.
 | Networking in the OCI path | The OCI runtime spec does not cover networking. `runc` and `crun` create or join a netns and stop. Podman wires it up with netavark. Building it there would fight the caller. |
 | `libseccomp` | It would hide the single most on-theme piece of work in the project. |
 | A daemon, an API, a UI | Runtimes are one-shot processes. Podman is the thing with a lifecycle. |
+| SELinux and AppArmor labelling | `setexeccon` and a policy toolchain, not a kernel interface worth learning twice. `linux.mountLabel` is honoured because it is a `context=` string passed to `mount(2)`; the process label is refused rather than ignored. |
+| systemd cgroup scopes | The systemd form of `cgroupsPath` means asking systemd for a transient scope over dbus. Writing the files by hand underneath it fights the manager, the same mistake as building networking into the OCI path. |
 
 ## Language and dependencies
 
@@ -241,12 +243,41 @@ deleting the host end takes the peer with it, on every path out.
 
 ### Phase 4 — OCI runtime spec
 
-`sudo podman --runtime $(pwd)/target/release/quilt run --rm alpine ls /`
+```
+sudo podman --cgroup-manager=cgroupfs --runtime $(pwd)/target/release/quilt run --rm \
+    --security-opt seccomp=unconfined --security-opt label=disable alpine ls /
+```
+
+Three flags more than you would like, and each one is the alternative to
+silently ignoring a security field, which is the outcome this phase exists to
+avoid. `--cgroup-manager=cgroupfs` and `--security-opt label=disable` are
+permanent, for the reasons in the non-goals table. `--security-opt
+seccomp=unconfined` goes away at phase 5.
 
 - `create` / `start` / `state` / `kill` / `delete`
 - `config.json` deserialization, honouring the subset that matters
 - State persisted where the spec says, in the format it says
 - Exit codes and error messages the caller expects
+
+What "the subset that matters" is should come from podman rather than from the
+spec document: a shim runtime that logs its argv and copies the bundle, then
+hands off to `crun`, says exactly what a real `podman run` asks for. Doing that
+first changed four decisions:
+
+- The network namespace arrives as a **path** to join, not a request to create.
+  This is what `setns` and the namespace entry ordering in `ns.rs` were for
+- There is **no user namespace** in the config. Podman has already made one
+  outside, so the `IdMapper` seam goes unused in the OCI path
+- A **cgroup namespace** is requested, so `CLONE_NEWCGROUP` turns on
+- `devpts` is in the mount list, which settles the `/dev/pts` question phase 1
+  deferred — podman states the options, so there is nothing to guess
+
+`process` and `linux` deserialize with `deny_unknown_fields`. They are where the
+security-bearing settings live, and a field quilt has never heard of is exactly
+the one it must not skip past. The price is that a future podman adding a field
+makes quilt complain rather than quietly ignore it, which is the right way round.
+The captured configs are committed under `tests/fixtures/` and parsed by the unit
+tests, so "every field podman sends is named by a struct" stays a checked claim.
 
 Root-only at this phase, hence `sudo podman`.
 
@@ -263,7 +294,8 @@ A hand-assembled classic-BPF filter, no library.
   syscall number, or a 32-bit caller walks straight through the filter
 - Default-deny with an allowlist, `SECCOMP_RET_ERRNO` over `KILL` so failures
   are debuggable
-- Honour the `linux.seccomp` section of `config.json`
+- Honour the `linux.seccomp` section of `config.json`, which is what removes
+  `--security-opt seccomp=unconfined` from the phase 4 demo
 
 **Accepts when:** the emitted program is byte-identical to libseccomp's output
 for the same policy, and a denied syscall returns `EPERM` rather than killing
@@ -297,6 +329,9 @@ reference implementation:
 
 - seccomp: diff against libseccomp's output for the same policy (as a dev-only
   comparison, not a dependency)
+- config.json: the bundles podman really produces, committed under
+  `tests/fixtures/` and parsed by the unit tests. `deny_unknown_fields` turns
+  that into a completeness check rather than a smoke test
 - netlink: capture what `ip` sends using an `nlmon` interface, store as golden.
   `scripts/capture-netlink.sh` does the capture; the comparison lives in
   `src/net/veth.rs` beside the message builders, which are split from the

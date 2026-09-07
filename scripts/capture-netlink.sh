@@ -36,12 +36,18 @@ cleanup
 ip link add nlmon0 type nlmon
 ip link set nlmon0 up
 
-# capture <output> <nlmsg_type> <ifname the message must name> <command...>
+# capture <output> <nlmsg_type> name|index <value> <command...>
+#
+# How a message identifies its interface depends on the message: RTM_NEWLINK
+# carries IFLA_IFNAME, while `ip link set` resolves the name up front and sends
+# only ifi_index. The filter has to match whichever form is in use, or it throws
+# away the very message it was asked for.
 capture() {
     out="tests/golden/$1"
     want_type=$2
-    want_name=$3
-    shift 3
+    match_kind=$3
+    match_value=$4
+    shift 4
 
     # Remove it first, so a failed capture leaves no stale golden behind.
     rm -f "$out"
@@ -56,10 +62,11 @@ capture() {
     kill "$tcpdump_pid" 2>/dev/null || true
     wait "$tcpdump_pid" 2>/dev/null || true
 
-    python3 - "$pcap" "$want_type" "$want_name" "$out" <<'PY'
+    python3 - "$pcap" "$want_type" "$match_kind" "$match_value" "$out" <<'PY'
 import struct, sys
 
-pcap_path, want_type, want_name, out_path = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+pcap_path, want_type = sys.argv[1], int(sys.argv[2])
+match_kind, match_value, out_path = sys.argv[3], sys.argv[4], sys.argv[5]
 
 NLM_F_REQUEST = 0x1
 IFLA_IFNAME = 3
@@ -99,6 +106,16 @@ def names(message):
     return found
 
 
+def identifies(message):
+    """Does this message name, or index, the interface we asked for?"""
+    if match_kind == "name":
+        return match_value in names(message)
+    # ifinfomsg is family:u8 pad:u8 type:u16 index:i32, so the index is the
+    # second word of the fixed struct.
+    index = struct.unpack_from("=i", message, NLMSGHDR_LEN + 4)[0]
+    return index == int(match_value)
+
+
 def find(packet):
     # The link-layer header nlmon puts in front is not worth assuming, so every
     # offset is tried -- but a candidate only counts if it is a whole message
@@ -114,7 +131,7 @@ def find(packet):
         if not 0 <= trailing < 4:
             continue
         message = bytearray(packet[at:at + length])
-        if want_name not in names(message):
+        if not identifies(message):
             continue
         return message
     return None
@@ -129,17 +146,24 @@ for packet in packets:
     message[8:16] = b"\x00" * 8
     with open(out_path, "w") as fh:
         fh.write(" ".join(f"{b:02x}" for b in message) + "\n")
-    print(f"{out_path}: {len(message)} bytes, names {want_name}")
+    print(f"{out_path}: {len(message)} bytes, {match_kind} {match_value}")
     sys.exit(0)
 
-sys.exit(f"no type-{want_type} request naming {want_name} was captured")
+sys.exit(f"no type-{want_type} request with {match_kind} {match_value} was captured")
 PY
     rm -f "$pcap"
+
+    # Per capture, not at the end: this script runs under sudo and can abort
+    # part way, and a root-owned golden cannot be rewritten or removed by the
+    # user who has to commit it.
+    if [ -n "${SUDO_UID:-}" ]; then
+        chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$out"
+    fi
 }
 
 # RTM_NEWLINK is 16, RTM_SETLINK is 19. The names must be the ones the message
 # builders in src/net/veth.rs use, or the comparison can never match.
-capture bridge-add.hex 16 quilt0 \
+capture bridge-add.hex 16 name quilt0 \
     ip link add quilt0 type bridge
 ip link del quilt0 2>/dev/null || true
 
@@ -148,17 +172,20 @@ ip link del quilt0 2>/dev/null || true
 # sends IFLA_NET_NS_PID. There is no invocation of `ip` that produces quilt's
 # shape, so the netns attribute is pinned by a unit test instead and the
 # capture covers the rest of the nest.
-capture veth-add.hex 16 qvgolden \
+capture veth-add.hex 16 name qvgolden \
     ip link add qvgolden type veth peer name eth0
 
-capture link-up.hex 19 qvgolden \
-    ip link set qvgolden up
-
-# The script runs under sudo, so without this the captures land root-owned and
-# cannot be rewritten or removed by the user who has to commit them.
-if [ -n "${SUDO_UID:-}" ]; then
-    chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" tests/golden/*.hex
+# `ip link set` sends no IFLA_IFNAME, so the filter matches on the index that
+# `ip` itself resolved the name to. That divergence is the thing
+# the_set_up_message_asks_for_the_same_thing_ip_asks_for goes on to assert.
+if [ ! -e /sys/class/net/qvgolden/ifindex ]; then
+    echo "qvgolden was not created, so link-up cannot be captured" >&2
+    exit 1
 fi
+qvgolden_index=$(cat /sys/class/net/qvgolden/ifindex)
+
+capture link-up.hex 19 index "$qvgolden_index" \
+    ip link set qvgolden up
 
 echo
 echo "Captured into tests/golden/. Re-run cargo test to compare."
