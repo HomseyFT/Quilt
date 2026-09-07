@@ -10,6 +10,7 @@ pub const SYS_CLONE3: u64 = 435;
 pub const SYS_CLOSE_RANGE: u64 = 436;
 pub const SYS_MOUNT_SETATTR: u64 = 442;
 pub const SYS_PRCTL: u64 = 157;
+pub const SYS_SECCOMP: u64 = 317;
 
 /// `prctl` option: remove one capability from the bounding set.
 pub const PR_CAPBSET_DROP: u64 = 24;

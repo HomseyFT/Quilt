@@ -3,8 +3,9 @@
 A Linux container runtime in Rust. See [SPEC.md](SPEC.md) for what it is and
 where it is going.
 
-Phases 1 to 4 are done: namespaces, mount setup, `pivot_root`, cgroup v2 limits,
-hand-assembled rtnetlink for veth networking, and the OCI runtime interface.
+Phases 1 to 5 are done: namespaces, mount setup, `pivot_root`, cgroup v2 limits,
+hand-assembled rtnetlink for veth networking, the OCI runtime interface, and a
+hand-assembled classic-BPF seccomp filter.
 
 ## Build
 
@@ -48,13 +49,15 @@ The veth pair is the only part torn down per container.
 
 ```sh
 sudo podman --cgroup-manager=cgroupfs --runtime $(pwd)/target/release/quilt run --rm \
-    --security-opt seccomp=unconfined --security-opt label=disable alpine ls /
+    --security-opt label=disable alpine ls /
 ```
 
-Three flags more than you would like. Each is the alternative to silently
-ignoring a security field in the bundle, which quilt refuses to do:
-`--security-opt seccomp=unconfined` goes away at phase 5, and the other two are
-non-goals — see SPEC.md.
+Two flags more than you would like. Each is the alternative to silently ignoring
+a security field in the bundle, which quilt refuses to do; both are non-goals,
+see SPEC.md. The container's own seccomp profile is applied.
+
+`--seccomp-log` puts every denial in the audit log, which is the difference
+between debugging a filter and guessing at it.
 
 The verbs work on their own too:
 

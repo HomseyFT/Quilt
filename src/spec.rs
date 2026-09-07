@@ -154,7 +154,7 @@ pub struct Linux {
     #[serde(default)]
     pub rootfs_propagation: Option<String>,
     #[serde(default)]
-    pub seccomp: Option<serde_json::Value>,
+    pub seccomp: Option<Seccomp>,
     #[serde(default)]
     pub uid_mappings: Vec<IdMapping>,
     #[serde(default)]
@@ -167,6 +167,45 @@ pub struct Linux {
     pub personality: Option<serde_json::Value>,
     #[serde(default)]
     pub time_offsets: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Seccomp {
+    pub default_action: String,
+    #[serde(default)]
+    pub default_errno_ret: Option<u32>,
+    #[serde(default)]
+    pub architectures: Vec<String>,
+    #[serde(default)]
+    pub flags: Vec<String>,
+    #[serde(default)]
+    pub listener_path: Option<String>,
+    #[serde(default)]
+    pub listener_metadata: Option<String>,
+    #[serde(default)]
+    pub syscalls: Vec<SyscallRule>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SyscallRule {
+    pub names: Vec<String>,
+    pub action: String,
+    #[serde(default)]
+    pub errno_ret: Option<u32>,
+    #[serde(default)]
+    pub args: Vec<SyscallArg>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SyscallArg {
+    pub index: u32,
+    pub value: u64,
+    #[serde(default)]
+    pub value_two: Option<u64>,
+    pub op: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,14 +337,6 @@ impl Config {
             )));
         }
 
-        if self.linux.seccomp.is_some() {
-            return Err(Error::msg(
-                "config.json asks for a seccomp filter, which quilt does not apply until phase 5. \
-                 Running it unfiltered would be worse than refusing: \
-                 podman run --security-opt seccomp=unconfined"
-                    .to_string(),
-            ));
-        }
         if self.process.selinux_label.is_some() {
             return Err(Error::msg(
                 "config.json asks for an SELinux process label, which quilt cannot apply: \
@@ -399,11 +430,26 @@ mod tests {
     }
 
     #[test]
-    fn a_default_bundle_is_refused_for_its_seccomp_profile() {
+    fn a_default_bundle_is_still_refused_for_its_selinux_label() {
+        // Seccomp is no longer a reason to refuse; the process label is, and
+        // the error names the flag that removes it.
         let config = Config::parse(&fixture("podman-default.json")).unwrap();
         let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("seccomp"), "{error}");
+        assert!(error.contains("SELinux"), "{error}");
         assert!(error.contains("--security-opt"), "the error should say how to proceed: {error}");
+    }
+
+    #[test]
+    fn the_seccomp_profile_podman_sends_is_fully_understood() {
+        // `deny_unknown_fields` makes this a completeness check: every key in
+        // the profile, down to the argument comparisons, has a field here.
+        let config = Config::parse(&fixture("podman-default.json")).unwrap();
+        let seccomp = config.linux.seccomp.as_ref().expect("podman sends a profile");
+
+        assert_eq!(seccomp.default_action, "SCMP_ACT_ERRNO");
+        assert_eq!(seccomp.default_errno_ret, Some(38));
+        assert_eq!(seccomp.syscalls.len(), 24);
+        assert!(seccomp.syscalls.iter().any(|rule| !rule.args.is_empty()));
     }
 
     #[test]

@@ -245,14 +245,14 @@ deleting the host end takes the peer with it, on every path out.
 
 ```
 sudo podman --cgroup-manager=cgroupfs --runtime $(pwd)/target/release/quilt run --rm \
-    --security-opt seccomp=unconfined --security-opt label=disable alpine ls /
+    --security-opt label=disable alpine ls /
 ```
 
-Three flags more than you would like, and each one is the alternative to
-silently ignoring a security field, which is the outcome this phase exists to
-avoid. `--cgroup-manager=cgroupfs` and `--security-opt label=disable` are
-permanent, for the reasons in the non-goals table. `--security-opt
-seccomp=unconfined` goes away at phase 5.
+Two flags more than you would like, and each one is the alternative to silently
+ignoring a security field, which is the outcome this phase exists to avoid. Both
+are permanent, for the reasons in the non-goals table. A third,
+`--security-opt seccomp=unconfined`, was needed until phase 5 applied the
+profile rather than refusing it.
 
 - `create` / `start` / `state` / `kill` / `delete`
 - `config.json` deserialization, honouring the subset that matters
@@ -282,6 +282,15 @@ and `CAP_SETGID` from the bounding set does not disturb the copies in effective,
 so becoming the container's user still works in between. None of this is visible
 at uid 0, which is what every default bundle asks for, so the acceptance tests
 include a `--user` case on purpose.
+
+`create` must not report success for a container that cannot run. Init reports
+it survived setup *before* it parks on the exec fifo, so anything checked after
+that point is discovered at `start` — by which time the caller has been told the
+container exists. Everything decidable from the bundle alone is therefore
+decided during `create`: the seccomp profile is assembled and thrown away, and
+the capability and rlimit names are resolved. A profile using an action quilt
+cannot build is the case that shows why, since the container would otherwise be
+created, started, and only then refuse to run.
 
 Two things a bundle does not say, which the runtime owes it anyway:
 
@@ -314,17 +323,44 @@ and mount groups.
 
 A hand-assembled classic-BPF filter, no library.
 
-- A small assembler: `bpf_stmt`, `bpf_jump`, jump-offset resolution
+- A small assembler with labels and jump-offset resolution. The offsets are the
+  point: they count from the *following* instruction, only go forward, and live
+  in a single byte. That last limit is not theoretical — the first layout here
+  used one shared kill return at the end of the program, and podman's profile
+  put it 780 instructions away. Each architecture check now carries its own
+  return, which costs eight bytes and assembles
 - Architecture check first — validate `AUDIT_ARCH_X86_64` before reading the
   syscall number, or a 32-bit caller walks straight through the filter
 - Default-deny with an allowlist, `SECCOMP_RET_ERRNO` over `KILL` so failures
-  are debuggable
+  are debuggable, and `--seccomp-log` to put every denial in the audit log
+- Syscall names the architecture does not have are skipped rather than refused.
+  79 of the 432 podman sends are 32-bit or x32 spellings like `chown32`; they
+  cannot be called here, and a caller from the architecture that has them is
+  killed by the check above
 - Honour the `linux.seccomp` section of `config.json`, which is what removes
   `--security-opt seccomp=unconfined` from the phase 4 demo
 
-**Accepts when:** the emitted program is byte-identical to libseccomp's output
-for the same policy, and a denied syscall returns `EPERM` rather than killing
-the process.
+**Accepts when:** a denied syscall returns an errno rather than killing the
+process, podman's real profile compiles and decides every rule the way it is
+written, and the phase 4 demo drops `--security-opt seccomp=unconfined`.
+
+Byte-identity with libseccomp was the original bar and is the wrong one.
+libseccomp sorts the syscall set and emits a binary-search jump tree; quilt
+emits rules in profile order. Both are correct and they share no bytes, so
+matching would mean reimplementing another project's optimiser to reproduce its
+layout — pinning its style rather than catching anything.
+
+What the tier was actually for still holds: "catches a filter that is subtly
+wrong but still loads". So the filter is run rather than read. `simulate` is a
+classic-BPF interpreter, and the tests assemble podman's 432-name profile and
+assert what it decides for each of 300-odd syscalls. That catches the failures
+that matter and byte comparison would not:
+
+- an argument test that only compares the low 32 bits, so `0x1_0000_0000`
+  passes a test for zero
+- a rule that reads an argument and leaves it in the accumulator, so every
+  later rule compares an argument value against a syscall number
+- an x32 caller reaching the allowlist under the x86-64 architecture token
 
 ### Phase 6 — rootless
 

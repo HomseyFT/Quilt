@@ -81,6 +81,28 @@ fn mask(names: &[String]) -> Result<u64> {
     Ok(bits)
 }
 
+/// Checks the names without changing anything.
+///
+/// `create` uses this so a bundle it could not carry out is refused while it is
+/// still a bundle, rather than at `start`, by which point `create` has already
+/// told the caller the container exists.
+pub fn validate(capabilities: &spec::Capabilities) -> Result<()> {
+    if !capabilities.ambient.is_empty() {
+        return Err(Error::msg(
+            "config.json asks for ambient capabilities, which quilt does not raise".to_string(),
+        ));
+    }
+    for names in [
+        &capabilities.bounding,
+        &capabilities.effective,
+        &capabilities.permitted,
+        &capabilities.inheritable,
+    ] {
+        mask(names)?;
+    }
+    Ok(())
+}
+
 /// Narrows the bounding set to what the bundle asked for.
 ///
 /// This half runs *before* the process changes user, and the order is not a
@@ -94,13 +116,9 @@ fn mask(names: &[String]) -> Result<u64> {
 /// from it leaves the copies in effective and permitted alone, and `setgroups`
 /// still works.
 pub fn narrow_bounding(capabilities: &spec::Capabilities) -> Result<()> {
-    // Checked here because this is the first of the two passes, and refusing
-    // before anything has changed beats refusing halfway through.
-    if !capabilities.ambient.is_empty() {
-        return Err(Error::msg(
-            "config.json asks for ambient capabilities, which quilt does not raise".to_string(),
-        ));
-    }
+    // Checked here too because this is the first of the two passes, and
+    // refusing before anything has changed beats refusing halfway through.
+    validate(capabilities)?;
 
     let bounding = mask(&capabilities.bounding)?;
     for number in 0..=MAX_CAPABILITY {

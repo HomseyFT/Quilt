@@ -164,6 +164,8 @@ pub struct OciInit {
     pub fifo: PathBuf,
     /// Inherited from `create`, which is waiting to hear that setup worked.
     pub ready_fd: std::os::fd::RawFd,
+    /// Ask the kernel to log every seccomp denial.
+    pub seccomp_log: bool,
 }
 
 pub fn exec_oci(init: OciInit) -> Result<std::convert::Infallible> {
@@ -251,9 +253,20 @@ pub fn exec_oci(init: OciInit) -> Result<std::convert::Infallible> {
     rustix::process::chdir(&config.process.cwd)
         .context(|| format!("chdir to {}", config.process.cwd.display()))?;
 
+    // Everything the filter would have to permit for quilt's own sake happens
+    // first. Searching PATH stats candidate files, and `chdir` above is a
+    // syscall the container has no reason to be allowed — resolving both now
+    // leaves `execve` as the only thing between the filter and the workload.
     let (program, argv, envp) = oci_workload(&config.process.args, &config.process.env)?;
     let argv_ptrs = pointer_array(&argv);
     let envp_ptrs = pointer_array(&envp);
+
+    // Last, and deliberately so: the setup above needs mount, pivot_root and
+    // writes to cgroup files, which is exactly what a container's policy denies.
+    if let Some(profile) = &config.linux.seccomp {
+        let filter = crate::seccomp::compile(profile)?;
+        crate::seccomp::install(&filter, init.seccomp_log)?;
+    }
 
     // SAFETY: both arrays are NULL terminated and outlive the call.
     let errno =
@@ -334,6 +347,11 @@ fn rlimit_resource(name: &str) -> Result<rustix::process::Resource> {
             return Err(Error::msg(format!("config.json sets an unknown rlimit: {other}")));
         }
     })
+}
+
+/// Checks the rlimit names without setting anything, for `create`.
+pub fn validate_rlimits(rlimits: &[crate::spec::Rlimit]) -> Result<()> {
+    rlimits.iter().try_for_each(|rlimit| rlimit_resource(&rlimit.kind).map(|_| ()))
 }
 
 fn apply_rlimits(rlimits: &[crate::spec::Rlimit]) -> Result<()> {

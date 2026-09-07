@@ -529,12 +529,21 @@ fn two_containers_at_once_do_not_collide() {
 
 /// A bundle with the smallest config.json that is still a real container.
 fn write_bundle(dir: &PathBuf, args: &str) -> PathBuf {
-    write_bundle_as(dir, args, "")
+    write_bundle_with(dir, args, "", "")
 }
 
-/// `process_extra` is spliced into the process object, for the fields a
-/// particular test cares about.
 fn write_bundle_as(dir: &PathBuf, args: &str, process_extra: &str) -> PathBuf {
+    write_bundle_with(dir, args, process_extra, "")
+}
+
+/// `process_extra` and `linux_extra` are spliced into their objects, for the
+/// fields a particular test cares about.
+fn write_bundle_with(
+    dir: &PathBuf,
+    args: &str,
+    process_extra: &str,
+    linux_extra: &str,
+) -> PathBuf {
     std::fs::create_dir_all(dir).unwrap();
     let config = format!(
         r#"{{
@@ -558,6 +567,7 @@ fn write_bundle_as(dir: &PathBuf, args: &str, process_extra: &str) -> PathBuf {
                   "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]}}
             ],
             "linux": {{
+                {linux_extra}
                 "namespaces": [{{"type": "pid"}}, {{"type": "ipc"}}, {{"type": "uts"}},
                                {{"type": "mount"}}, {{"type": "network"}}],
                 "resources": {{"pids": {{"limit": 64}}}},
@@ -567,6 +577,7 @@ fn write_bundle_as(dir: &PathBuf, args: &str, process_extra: &str) -> PathBuf {
         }}"#,
         args = args,
         process_extra = process_extra,
+        linux_extra = linux_extra,
         rootfs = rootfs().display()
     );
     std::fs::write(dir.join("config.json"), config).unwrap();
@@ -599,6 +610,30 @@ fn create_container(state_root: &PathBuf, bundle: &PathBuf, id: &str, log: &Path
     let stderr = std::fs::read_to_string(&errors).unwrap_or_default();
     assert!(status.success(), "create failed: {stderr}");
     stderr
+}
+
+/// `create` where the bundle is expected to be refused. Returns its stderr.
+///
+/// Redirected for the same reason as `create_container`: on the paths where
+/// create *succeeds*, `Command::output()` would wait for an init process that
+/// is parked on the exec fifo and will not close its stdio until `start`.
+fn try_create_container(state_root: &PathBuf, bundle: &PathBuf, id: &str) -> (bool, String) {
+    let work = state_root.with_extension("create-log");
+    std::fs::create_dir_all(&work).unwrap();
+    let errors = work.join(format!("{id}.err"));
+
+    let status = Command::new(env!("CARGO_BIN_EXE_quilt"))
+        .arg("--root")
+        .arg(state_root)
+        .args(["create", "--bundle"])
+        .arg(bundle)
+        .arg(id)
+        .stdout(std::fs::File::create(work.join(format!("{id}.out"))).unwrap())
+        .stderr(std::fs::File::create(&errors).unwrap())
+        .status()
+        .expect("failed to spawn quilt");
+
+    (status.success(), std::fs::read_to_string(&errors).unwrap_or_default())
 }
 
 fn quilt_oci(state_root: &PathBuf, args: &[&str]) -> Output {
@@ -758,8 +793,9 @@ fn an_unknown_container_is_an_error_not_a_panic() {
     std::fs::remove_dir_all(&state_root).ok();
 }
 
-/// The phase 4 demo. The three security options are the ones SPEC.md explains:
-/// seccomp is phase 5, and SELinux labelling and systemd scopes are non-goals.
+/// The phase 4 demo, now with the container's real seccomp profile applied:
+/// `--security-opt seccomp=unconfined` is gone, which is what phase 5 was for.
+/// The two flags left are non-goals, explained in SPEC.md.
 ///
 /// This is the phase's headline acceptance criterion, so it is not allowed to
 /// skip itself into the green over a missing image: `scripts/root-tests.sh`
@@ -798,8 +834,6 @@ fn podman_runs_a_container_end_to_end_through_quilt() {
             "run",
             "--rm",
             "--security-opt",
-            "seccomp=unconfined",
-            "--security-opt",
             "label=disable",
             "alpine",
             "ls",
@@ -816,4 +850,137 @@ fn podman_runs_a_container_end_to_end_through_quilt() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(stdout.contains("etc"), "the container did not list its root: {stdout}");
+}
+
+// --- Phase 5: seccomp -----------------------------------------------------
+
+/// Runs a bundle with `seccomp` as its `linux.seccomp` and returns what the
+/// workload wrote, plus init's own stderr.
+fn run_with_seccomp(name: &str, args: &str, seccomp: &str) -> (String, String) {
+    let work = std::env::temp_dir().join(format!("quilt-seccomp-{name}"));
+    std::fs::remove_dir_all(&work).ok();
+    let bundle = write_bundle_with(
+        &work.join("bundle"),
+        args,
+        "",
+        &format!(r#""seccomp": {seccomp},"#),
+    );
+    let state_root = work.join("state");
+    let log = work.join("stdout");
+    std::fs::create_dir_all(&state_root).unwrap();
+
+    clear_container(&state_root, name);
+    create_container(&state_root, &bundle, name, &log);
+    quilt_oci(&state_root, &["start", name]);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while status_of(&state_root, name) != "stopped" && deadline > std::time::Instant::now() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let output = std::fs::read_to_string(&log).unwrap_or_default();
+    let errors = std::fs::read_to_string(log.with_extension("err")).unwrap_or_default();
+
+    quilt_oci(&state_root, &["delete", "--force", name]);
+    std::fs::remove_dir_all(&work).ok();
+    (output, errors)
+}
+
+#[test]
+fn a_denied_syscall_returns_an_errno_rather_than_killing_the_container() {
+    requires_root!();
+    // The spec's own argument for preferring an errno: the workload keeps
+    // running and says which call failed, instead of leaving a corpse.
+    let (output, errors) = run_with_seccomp(
+        "seccomp-errno",
+        r#""/bin/sh", "-c", "chmod 777 /tmp 2>/dev/null; echo rc=$?; echo alive""#,
+        r#"{
+            "defaultAction": "SCMP_ACT_ALLOW",
+            "architectures": ["SCMP_ARCH_X86_64"],
+            "syscalls": [{"names": ["chmod", "fchmodat", "fchmodat2"],
+                          "action": "SCMP_ACT_ERRNO", "errnoRet": 1}]
+        }"#,
+    );
+
+    assert!(output.contains("rc=1"), "chmod should have failed with EPERM: {output}{errors}");
+    assert!(output.contains("alive"), "the workload should have survived: {output}{errors}");
+}
+
+#[test]
+fn an_allowed_syscall_is_untouched_by_the_filter() {
+    requires_root!();
+    let (output, errors) = run_with_seccomp(
+        "seccomp-allow",
+        r#""/bin/sh", "-c", "echo hello""#,
+        r#"{
+            "defaultAction": "SCMP_ACT_ERRNO",
+            "defaultErrnoRet": 38,
+            "architectures": ["SCMP_ARCH_X86_64"],
+            "syscalls": [{"names": ["read", "write", "execve", "exit", "exit_group",
+                                    "brk", "mmap", "munmap", "mprotect", "arch_prctl",
+                                    "rt_sigaction", "rt_sigprocmask", "openat", "close",
+                                    "fstat", "newfstatat", "getpid", "wait4", "clone",
+                                    "set_tid_address", "set_robust_list", "rseq",
+                                    "prlimit64", "getuid", "getgid", "geteuid", "getegid",
+                                    "ioctl", "readlink", "readlinkv", "getrandom",
+                                    "pread64", "lseek", "uname", "fcntl", "sysinfo",
+                                    "dup2", "dup3", "pipe2", "vfork", "getppid", "setpgid"],
+                          "action": "SCMP_ACT_ALLOW"}]
+        }"#,
+    );
+
+    assert_eq!(output.trim(), "hello", "an allowlisted workload should run: {errors}");
+}
+
+#[test]
+fn a_kill_action_kills_the_caller_rather_than_returning_an_error() {
+    requires_root!();
+    // SCMP_ACT_KILL_PROCESS ends the process that made the call — here the
+    // `chmod` the shell forked, not the shell — so the shell lives on to report
+    // how its child died. That exit status is the whole assertion, and it tells
+    // the three outcomes apart: 0 means the filter never applied, 1 means it
+    // returned EPERM as in the test above, and 159 is 128 + SIGSYS.
+    let (output, errors) = run_with_seccomp(
+        "seccomp-kill",
+        r#""/bin/sh", "-c", "chmod 777 /tmp; echo rc=$?""#,
+        r#"{
+            "defaultAction": "SCMP_ACT_ALLOW",
+            "architectures": ["SCMP_ARCH_X86_64"],
+            "syscalls": [{"names": ["chmod", "fchmodat", "fchmodat2"],
+                          "action": "SCMP_ACT_KILL_PROCESS"}]
+        }"#,
+    );
+
+    assert!(
+        output.contains("rc=159"),
+        "chmod should have died of SIGSYS, got {output:?}: {errors}"
+    );
+}
+
+#[test]
+fn a_profile_quilt_cannot_build_is_refused_before_the_container_starts() {
+    requires_root!();
+    // SCMP_ACT_NOTIFY needs a user-space agent on the other end of a
+    // descriptor. Accepting the bundle and running it unfiltered would look
+    // exactly like success.
+    let work = std::env::temp_dir().join("quilt-seccomp-notify");
+    std::fs::remove_dir_all(&work).ok();
+    let bundle = write_bundle_with(
+        &work.join("bundle"),
+        r#""/bin/sh", "-c", "echo ran""#,
+        "",
+        r#""seccomp": {"defaultAction": "SCMP_ACT_ALLOW",
+                       "syscalls": [{"names": ["chmod"], "action": "SCMP_ACT_NOTIFY"}]},"#,
+    );
+    let state_root = work.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    clear_container(&state_root, "notify-test");
+
+    let (created, stderr) = try_create_container(&state_root, &bundle, "notify-test");
+    let started = state_root.join("notify-test").exists();
+    std::fs::remove_dir_all(&work).ok();
+
+    assert!(!created, "a profile quilt cannot build should refuse the container");
+    assert!(stderr.contains("SCMP_ACT_NOTIFY"), "the error should name the action: {stderr}");
+    assert!(!started, "the refusal must happen before any container state exists");
 }

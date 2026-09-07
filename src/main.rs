@@ -7,6 +7,7 @@ mod init;
 mod mount;
 mod net;
 mod ns;
+mod seccomp;
 mod spec;
 mod syscall;
 
@@ -42,6 +43,13 @@ struct Cli {
     log_format: Option<String>,
     #[arg(long, global = true)]
     debug: bool,
+
+    /// Ask the kernel to log every seccomp denial to the audit log.
+    ///
+    /// A denied syscall otherwise surfaces as an unexplained failure deep
+    /// inside a program you did not write.
+    #[arg(long, global = true)]
+    seccomp_log: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -107,6 +115,8 @@ struct InitOciArgs {
     fifo: PathBuf,
     #[arg(long)]
     ready_fd: std::os::fd::RawFd,
+    #[arg(long)]
+    seccomp_log: bool,
 }
 
 #[derive(Args)]
@@ -211,7 +221,13 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     path.display()
                 )));
             }
-            container::create(&cli.root, &args.id, &args.bundle, args.pid_file.as_deref())?;
+            container::create(
+                &cli.root,
+                &args.id,
+                &args.bundle,
+                args.pid_file.as_deref(),
+                cli.seccomp_log,
+            )?;
             Ok(0)
         }
 
@@ -240,6 +256,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 bundle: args.bundle,
                 fifo: args.fifo,
                 ready_fd: args.ready_fd,
+                seccomp_log: args.seccomp_log,
             })?;
             unreachable!("init::exec_oci only returns an error")
         }

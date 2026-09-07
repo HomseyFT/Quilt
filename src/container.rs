@@ -544,6 +544,7 @@ pub fn create(
     id: &str,
     bundle: &Path,
     pid_file: Option<&Path>,
+    seccomp_log: bool,
 ) -> Result<()> {
     let bundle = bundle
         .canonicalize()
@@ -554,6 +555,22 @@ pub fn create(
 
     let config = crate::spec::Config::parse(&json)?;
     config.validate()?;
+
+    // Anything that can be decided from the bundle alone is decided now.
+    //
+    // The rest of the setup happens in the init process, and init reports it
+    // survived *before* it parks on the exec fifo — so a policy quilt cannot
+    // carry out would otherwise not be discovered until `start`, long after
+    // `create` told the caller the container exists. A seccomp profile using an
+    // action quilt cannot assemble is the case that shows it: the container
+    // would be created, started, and only then refuse to run.
+    if let Some(profile) = &config.linux.seccomp {
+        crate::seccomp::compile(profile)?;
+    }
+    if let Some(capabilities) = &config.process.capabilities {
+        crate::caps::validate(capabilities)?;
+    }
+    crate::init::validate_rlimits(&config.process.rlimits)?;
 
     let namespaces = Namespaces::to_create(&config.linux.namespaces)?;
     if namespaces.user {
@@ -585,7 +602,7 @@ pub fn create(
     let ready_number = ready_write.as_raw_fd();
 
     let exe = CString::new("/proc/self/exe").expect("no interior NUL");
-    let argv = cstrings(&[
+    let mut init_argv = vec![
         "quilt".to_string(),
         "init-oci".to_string(),
         "--bundle".to_string(),
@@ -594,7 +611,11 @@ pub fn create(
         fifo.display().to_string(),
         "--ready-fd".to_string(),
         ready_number.to_string(),
-    ])?;
+    ];
+    if seccomp_log {
+        init_argv.push("--seccomp-log".to_string());
+    }
+    let argv = cstrings(&init_argv)?;
     let envp = cstrings(&[])?;
     let argv_ptrs = pointer_array(&argv);
     let envp_ptrs = pointer_array(&envp);
