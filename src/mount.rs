@@ -25,7 +25,10 @@ pub enum Create {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MountOp {
     /// `mount(NULL, target, NULL, flags, NULL)` — propagation only.
-    Propagation { target: PathBuf, flags: MountPropagationFlags },
+    Propagation {
+        target: PathBuf,
+        flags: MountPropagationFlags,
+    },
     Filesystem {
         source: String,
         target: PathBuf,
@@ -41,13 +44,22 @@ pub enum MountOp {
         readonly: bool,
         create: Create,
     },
-    Symlink { original: String, link: PathBuf },
-    PivotRoot { new_root: PathBuf },
+    Symlink {
+        original: String,
+        link: PathBuf,
+    },
+    PivotRoot {
+        new_root: PathBuf,
+    },
     /// Hide a path inside the container. Applied after the pivot, so the path
     /// is container-absolute.
-    Mask { path: PathBuf },
+    Mask {
+        path: PathBuf,
+    },
     /// Make a path inside the container read-only, likewise after the pivot.
-    Freeze { path: PathBuf },
+    Freeze {
+        path: PathBuf,
+    },
 }
 
 impl MountOp {
@@ -119,16 +131,13 @@ impl MountStrategy for StandardMounts {
             return Err(Error::msg(format!("rootfs {} must be absolute", rootfs.display())));
         }
 
-        let nosuid_noexec_nodev =
-            MountFlags::NOSUID | MountFlags::NOEXEC | MountFlags::NODEV;
-        let mut ops = Vec::new();
-
+        let nosuid_noexec_nodev = MountFlags::NOSUID | MountFlags::NOEXEC | MountFlags::NODEV;
         // Nothing done below may propagate back to the host. This has to be
         // first, and it has to be recursive.
-        ops.push(MountOp::Propagation {
+        let mut ops = vec![MountOp::Propagation {
             target: PathBuf::from("/"),
             flags: MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
-        });
+        }];
 
         // pivot_root requires new_root to be a mount point distinct from its
         // parent, so the rootfs is bound onto itself.
@@ -369,10 +378,10 @@ impl OciMounts {
         // way, and mqueue is not one of them.
         const LABELLED: &[&str] = &["tmpfs", "devpts"];
 
-        if let Some(label) = &self.mount_label {
-            if LABELLED.contains(&fstype) {
-                data.push(format!("context=\"{label}\""));
-            }
+        if let Some(label) = &self.mount_label
+            && LABELLED.contains(&fstype)
+        {
+            data.push(format!("context=\"{label}\""));
         }
         (!data.is_empty()).then(|| data.join(","))
     }
@@ -441,8 +450,7 @@ fn parse_options(options: &[String]) -> (MountFlags, Option<MountPropagationFlag
             }
             "private" => propagation = Some(MountPropagationFlags::PRIVATE),
             "rprivate" => {
-                propagation =
-                    Some(MountPropagationFlags::PRIVATE | MountPropagationFlags::REC)
+                propagation = Some(MountPropagationFlags::PRIVATE | MountPropagationFlags::REC)
             }
             "shared" => propagation = Some(MountPropagationFlags::SHARED),
             "rshared" => {
@@ -450,13 +458,11 @@ fn parse_options(options: &[String]) -> (MountFlags, Option<MountPropagationFlag
             }
             "slave" => propagation = Some(MountPropagationFlags::DOWNSTREAM),
             "rslave" => {
-                propagation =
-                    Some(MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC)
+                propagation = Some(MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC)
             }
             "unbindable" => propagation = Some(MountPropagationFlags::UNBINDABLE),
             "runbindable" => {
-                propagation =
-                    Some(MountPropagationFlags::UNBINDABLE | MountPropagationFlags::REC)
+                propagation = Some(MountPropagationFlags::UNBINDABLE | MountPropagationFlags::REC)
             }
             other => data.push(other.to_string()),
         }
@@ -503,13 +509,11 @@ fn apply_op(op: &MountOp) -> Result<()> {
             Ok(())
         }
 
-        MountOp::Symlink { original, link } => {
-            match std::os::unix::fs::symlink(original, link) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-                Err(e) => Err(e).context(|| format!("symlinking {}", link.display())),
-            }
-        }
+        MountOp::Symlink { original, link } => match std::os::unix::fs::symlink(original, link) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e).context(|| format!("symlinking {}", link.display())),
+        },
 
         MountOp::PivotRoot { new_root } => pivot_root(new_root),
 
@@ -541,8 +545,7 @@ fn mask(path: &Path) -> Result<()> {
         mount::mount("tmpfs", path, "tmpfs", MountFlags::RDONLY, Some(data.as_c_str()))
             .context(|| format!("masking the directory {}", path.display()))
     } else {
-        mount::mount_bind("/dev/null", path)
-            .context(|| format!("masking {}", path.display()))
+        mount::mount_bind("/dev/null", path).context(|| format!("masking {}", path.display()))
     }
 }
 
@@ -550,8 +553,7 @@ fn mask(path: &Path) -> Result<()> {
 /// detached. Avoids needing a `put_old` directory inside the image, and unlike
 /// `chroot` it actually removes the host tree from the namespace.
 fn pivot_root(new_root: &Path) -> Result<()> {
-    rustix::process::chdir(new_root)
-        .context(|| format!("chdir to {}", new_root.display()))?;
+    rustix::process::chdir(new_root).context(|| format!("chdir to {}", new_root.display()))?;
     rustix::process::pivot_root(".", ".").context(|| "pivot_root(\".\", \".\")".to_string())?;
     // The old root is now covering the new one at ".". Detaching it is what
     // makes the host tree unreachable.
@@ -599,16 +601,15 @@ fn set_readonly(target: &Path, recursive: bool) -> Result<()> {
         )
     };
 
-    syscall::result(ret)
-        .map(|_| ())
-        .context(|| format!("setting {} read-only", target.display()))
+    syscall::result(ret).map(|_| ()).context(|| format!("setting {} read-only", target.display()))
 }
 
 fn ensure_target(target: &Path, create: Create) -> Result<()> {
     match create {
         Create::Nothing => Ok(()),
-        Create::Dir => std::fs::create_dir_all(target)
-            .context(|| format!("creating {}", target.display())),
+        Create::Dir => {
+            std::fs::create_dir_all(target).context(|| format!("creating {}", target.display()))
+        }
         Create::File => {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)
@@ -732,8 +733,8 @@ mod tests {
     }
 
     fn oci_plan() -> MountPlan {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/podman-unconfined.json");
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/podman-unconfined.json");
         let json = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{} is a committed capture: {e}", path.display()));
         let config = spec::Config::parse(&json).unwrap();
@@ -785,10 +786,7 @@ mod tests {
     fn propagation_words_are_kept_apart_from_mount_flags() {
         let (flags, propagation, data) = parse_options(&["rprivate".to_string()]);
         assert_eq!(flags, MountFlags::empty());
-        assert_eq!(
-            propagation,
-            Some(MountPropagationFlags::PRIVATE | MountPropagationFlags::REC)
-        );
+        assert_eq!(propagation, Some(MountPropagationFlags::PRIVATE | MountPropagationFlags::REC));
         assert!(data.is_empty());
     }
 
@@ -825,8 +823,7 @@ mod tests {
         let plan = oci_plan();
         let dev = position(&plan, "/srv/rootfs/dev");
         let null = position(&plan, "/srv/rootfs/dev/null");
-        let pivot =
-            plan.ops.iter().position(|op| matches!(op, MountOp::PivotRoot { .. })).unwrap();
+        let pivot = plan.ops.iter().position(|op| matches!(op, MountOp::PivotRoot { .. })).unwrap();
 
         assert!(dev < null, "the device nodes need the tmpfs to be there first");
         assert!(null < pivot);
@@ -838,8 +835,7 @@ mod tests {
         // container with masked paths and no /dev/null cannot be created.
         let plan = oci_plan();
         let null = position(&plan, "/srv/rootfs/dev/null");
-        let masked =
-            plan.ops.iter().position(|op| matches!(op, MountOp::Mask { .. })).unwrap();
+        let masked = plan.ops.iter().position(|op| matches!(op, MountOp::Mask { .. })).unwrap();
         assert!(null < masked);
     }
 
@@ -922,10 +918,8 @@ mod tests {
             .position(|op| matches!(op, MountOp::PivotRoot { .. }))
             .expect("the plan pivots");
 
-        let masked =
-            plan.ops.iter().position(|op| matches!(op, MountOp::Mask { .. })).unwrap();
-        let frozen =
-            plan.ops.iter().position(|op| matches!(op, MountOp::Freeze { .. })).unwrap();
+        let masked = plan.ops.iter().position(|op| matches!(op, MountOp::Mask { .. })).unwrap();
+        let frozen = plan.ops.iter().position(|op| matches!(op, MountOp::Freeze { .. })).unwrap();
 
         assert!(pivot < masked, "a masked path names a location inside the container");
         assert!(pivot < frozen);

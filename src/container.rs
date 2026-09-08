@@ -56,8 +56,7 @@ pub fn run(
     // The clone below copies this guard into the child, but every path the
     // child takes ends in `execve` or `exit_group`, neither of which unwinds,
     // so the child never runs the destructor and never deletes the scope.
-    let scope = Scope::create(driver)?;
-    scope.apply(&spec.limits)?;
+    let scope = Scope::create(driver, &spec.limits)?;
     let scope_fd = scope.open()?;
 
     // Everything the child touches between `clone3` and `execve` is built here,
@@ -92,7 +91,8 @@ pub fn run(
             }
             // SAFETY: the pointer arrays outlive this call and are NULL
             // terminated; `execve` only returns on failure.
-            let _ = unsafe { rustix::runtime::execve(&exe, argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
+            let _ =
+                unsafe { rustix::runtime::execve(&exe, argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
             rustix::runtime::exit_group(EXIT_EXEC_FAILED);
         }
 
@@ -491,10 +491,9 @@ impl StateDir {
     fn create(path: PathBuf) -> Result<Self> {
         match std::fs::create_dir_all(&path) {
             Ok(()) if is_empty_dir(&path) => Ok(Self { path }),
-            Ok(()) => Err(Error::msg(format!(
-                "a container is already registered at {}",
-                path.display()
-            ))),
+            Ok(()) => {
+                Err(Error::msg(format!("a container is already registered at {}", path.display())))
+            }
             Err(e) => Err(e).context(|| format!("creating {}", path.display())),
         }
     }
@@ -621,8 +620,8 @@ pub fn create(
     .context(|| format!("creating the exec fifo at {}", fifo.display()))?;
 
     let driver = crate::cgroup::driver_for_this_user(id, config.linux.cgroups_path.as_deref())?;
-    let scope = Scope::create(driver.as_ref())?;
-    scope.apply(&Limits::from_oci(config.linux.resources.as_ref())?)?;
+    let scope =
+        Scope::create(driver.as_ref(), &Limits::from_oci(config.linux.resources.as_ref())?)?;
     let scope_fd = scope.open()?;
 
     // Not CLOEXEC: init inherits this and reports on it, which is the only way
@@ -767,8 +766,7 @@ pub fn kill(root: &Path, id: &str, signal: &str) -> Result<()> {
     let signal = parse_signal(signal)?;
     let pid = Pid::from_raw(state.pid)
         .ok_or_else(|| Error::msg(format!("container {id} has no valid pid")))?;
-    rustix::process::kill_process(pid, signal)
-        .context(|| format!("signalling container {id}"))
+    rustix::process::kill_process(pid, signal).context(|| format!("signalling container {id}"))
 }
 
 /// `delete`: take the container's state and cgroup away.

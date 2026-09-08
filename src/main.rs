@@ -276,11 +276,8 @@ fn run(args: RunArgs) -> Result<i32> {
         return Err(Error::msg(format!("{} is not a directory", rootfs.display())));
     }
 
-    let readonly_binds = args
-        .readonly
-        .iter()
-        .map(|value| readonly_bind(value))
-        .collect::<Result<Vec<_>>>()?;
+    let readonly_binds =
+        args.readonly.iter().map(|value| readonly_bind(value)).collect::<Result<Vec<_>>>()?;
 
     let limits = Limits::from_cli(
         args.memory.as_deref().map(cgroup::parse_size).transpose()?,
@@ -400,15 +397,17 @@ mod tests {
 
     #[test]
     fn cli_accepts_bridge_networking() {
-        let cli =
-            Cli::try_parse_from(["quilt", "run", "--net", "bridge", "./rootfs", "/bin/sh"]).unwrap();
+        let cli = Cli::try_parse_from(["quilt", "run", "--net", "bridge", "./rootfs", "/bin/sh"])
+            .unwrap();
         let Command::Run(args) = cli.command else { panic!("expected run") };
         assert_eq!(args.net, NetworkMode::Bridge);
     }
 
     #[test]
     fn cli_rejects_an_unknown_network_mode() {
-        assert!(Cli::try_parse_from(["quilt", "run", "--net", "macvlan", "./rootfs", "sh"]).is_err());
+        assert!(
+            Cli::try_parse_from(["quilt", "run", "--net", "macvlan", "./rootfs", "sh"]).is_err()
+        );
     }
 
     #[test]

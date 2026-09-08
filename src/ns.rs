@@ -38,15 +38,8 @@ pub struct Namespaces {
 impl Namespaces {
     /// The phase 1 set: everything the spec lists, minus the cgroup namespace,
     /// which only becomes interesting once phase 2 has a scope to hide.
-    pub const DEFAULT: Self = Self {
-        mount: true,
-        pid: true,
-        net: true,
-        uts: true,
-        ipc: true,
-        user: true,
-        cgroup: false,
-    };
+    pub const DEFAULT: Self =
+        Self { mount: true, pid: true, net: true, uts: true, ipc: true, user: true, cgroup: false };
 
     pub fn clone_flags(&self) -> u64 {
         let mut flags = 0;

@@ -40,15 +40,14 @@ pub fn exec(spec: InitSpec) -> Result<std::convert::Infallible> {
     let envp_ptrs = pointer_array(&envp);
 
     // SAFETY: both arrays are NULL terminated and outlive the call.
-    let errno = unsafe { rustix::runtime::execve(&program, argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
+    let errno =
+        unsafe { rustix::runtime::execve(&program, argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
     Err(errno).context(|| format!("exec {:?}", spec.argv[0]))
 }
 
 /// The workload's program path, argv and the environment inherited from `run`.
 fn workload(argv: &[String]) -> Result<(CString, Vec<CString>, Vec<CString>)> {
-    let program = argv
-        .first()
-        .ok_or_else(|| Error::msg("no command given".to_string()))?;
+    let program = argv.first().ok_or_else(|| Error::msg("no command given".to_string()))?;
     let program = CString::new(program.as_str())
         .map_err(|_| Error::msg("the command contains a NUL byte".to_string()))?;
 
@@ -84,70 +83,7 @@ pub fn parse_bind(value: &str) -> Result<BindSpec> {
     if source.is_empty() || destination.is_empty() {
         return Err(Error::msg(format!("bind {value:?} has an empty side")));
     }
-    Ok(BindSpec {
-        source: PathBuf::from(source),
-        destination: PathBuf::from(destination),
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_bind_splits_on_the_first_colon() {
-        let bind = parse_bind("/etc/hosts:/etc/hosts").unwrap();
-        assert_eq!(bind.source, PathBuf::from("/etc/hosts"));
-        assert_eq!(bind.destination, PathBuf::from("/etc/hosts"));
-    }
-
-    #[test]
-    fn a_bind_without_a_colon_is_rejected() {
-        assert!(parse_bind("/etc/hosts").is_err());
-    }
-
-    #[test]
-    fn a_bind_with_an_empty_side_is_rejected() {
-        assert!(parse_bind(":/etc/hosts").is_err());
-        assert!(parse_bind("/etc/hosts:").is_err());
-    }
-
-    #[test]
-    fn a_bare_command_is_searched_for_along_path() {
-        // podman sends ["ls", "/"], not ["/bin/ls", "/"].
-        let env = vec!["PATH=/usr/bin:/bin".to_string()];
-        assert_eq!(
-            program_candidates("ls", &env),
-            [PathBuf::from("/usr/bin/ls"), PathBuf::from("/bin/ls")]
-        );
-    }
-
-    #[test]
-    fn a_command_with_a_slash_is_a_path_already() {
-        let env = vec!["PATH=/usr/bin".to_string()];
-        assert_eq!(program_candidates("/bin/sh", &env), [PathBuf::from("/bin/sh")]);
-        assert_eq!(program_candidates("./run.sh", &env), [PathBuf::from("./run.sh")]);
-    }
-
-    #[test]
-    fn empty_path_entries_are_skipped_rather_than_becoming_the_root() {
-        let env = vec!["PATH=/bin::/usr/bin".to_string()];
-        assert_eq!(
-            program_candidates("ls", &env),
-            [PathBuf::from("/bin/ls"), PathBuf::from("/usr/bin/ls")]
-        );
-    }
-
-    #[test]
-    fn a_bare_command_with_no_path_at_all_has_nowhere_to_look() {
-        assert!(program_candidates("ls", &[]).is_empty());
-        assert!(resolve_program("ls", &[]).is_err());
-    }
-
-    #[test]
-    fn an_empty_command_is_rejected() {
-        assert!(workload(&[]).is_err());
-    }
+    Ok(BindSpec { source: PathBuf::from(source), destination: PathBuf::from(destination) })
 }
 
 // ---------------------------------------------------------------------------
@@ -191,9 +127,10 @@ pub fn exec_oci(init: OciInit) -> Result<std::convert::Infallible> {
     // The fifo lives outside the container, and `pivot_root` is about to put it
     // out of reach by name. A directory descriptor survives that, and `openat`
     // through it does not go near path resolution.
-    let fifo_dir = init.fifo.parent().ok_or_else(|| {
-        Error::msg(format!("{} has no directory", init.fifo.display()))
-    })?;
+    let fifo_dir = init
+        .fifo
+        .parent()
+        .ok_or_else(|| Error::msg(format!("{} has no directory", init.fifo.display())))?;
     let fifo_dir = rustix::fs::open(
         fifo_dir,
         rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
@@ -278,8 +215,7 @@ pub fn exec_oci(init: OciInit) -> Result<std::convert::Infallible> {
 fn signal_ready(fd: std::os::fd::RawFd) -> Result<()> {
     // SAFETY: `create` handed this descriptor over and is holding the far end.
     let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-    rustix::io::write(borrowed, &[1u8])
-        .context(|| "reporting readiness to create".to_string())?;
+    rustix::io::write(borrowed, &[1u8]).context(|| "reporting readiness to create".to_string())?;
     // SAFETY: taking ownership back so the descriptor closes here; `create`
     // reads EOF if anything after this point fails.
     drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
@@ -372,18 +308,17 @@ fn apply_user(user: &crate::spec::User) -> Result<()> {
         rustix::process::umask(rustix::fs::Mode::from_bits_truncate(mask));
     }
 
-    let groups: Vec<rustix::process::Gid> = user
-        .additional_gids
-        .iter()
-        .map(|gid| rustix::process::Gid::from_raw(*gid))
-        .collect();
-    rustix::thread::set_thread_groups(&groups).context(|| "setting supplementary groups".to_string())?;
+    let groups: Vec<rustix::process::Gid> =
+        user.additional_gids.iter().map(|gid| rustix::process::Gid::from_raw(*gid)).collect();
+    rustix::thread::set_thread_groups(&groups)
+        .context(|| "setting supplementary groups".to_string())?;
 
     // The ids come from the bundle; the kernel decides whether this process is
     // allowed to assume them.
     let gid = rustix::process::Gid::from_raw(user.gid);
     let uid = rustix::process::Uid::from_raw(user.uid);
-    rustix::thread::set_thread_res_gid(gid, gid, gid).context(|| "setting the group id".to_string())?;
+    rustix::thread::set_thread_res_gid(gid, gid, gid)
+        .context(|| "setting the group id".to_string())?;
     rustix::thread::set_thread_res_uid(uid, uid, uid).context(|| "setting the user id".to_string())
 }
 
@@ -433,13 +368,9 @@ fn resolve_program(program: &str, env: &[String]) -> Result<CString> {
 }
 
 /// The workload's program, argv and environment, all from the bundle.
-fn oci_workload(
-    args: &[String],
-    env: &[String],
-) -> Result<(CString, Vec<CString>, Vec<CString>)> {
-    let program = args
-        .first()
-        .ok_or_else(|| Error::msg("config.json has no process.args".to_string()))?;
+fn oci_workload(args: &[String], env: &[String]) -> Result<(CString, Vec<CString>, Vec<CString>)> {
+    let program =
+        args.first().ok_or_else(|| Error::msg("config.json has no process.args".to_string()))?;
     let program = resolve_program(program, env)?;
 
     let to_cstrings = |values: &[String]| -> Result<Vec<CString>> {
@@ -453,4 +384,64 @@ fn oci_workload(
     };
 
     Ok((program, to_cstrings(args)?, to_cstrings(env)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bind_splits_on_the_first_colon() {
+        let bind = parse_bind("/etc/hosts:/etc/hosts").unwrap();
+        assert_eq!(bind.source, PathBuf::from("/etc/hosts"));
+        assert_eq!(bind.destination, PathBuf::from("/etc/hosts"));
+    }
+
+    #[test]
+    fn a_bind_without_a_colon_is_rejected() {
+        assert!(parse_bind("/etc/hosts").is_err());
+    }
+
+    #[test]
+    fn a_bind_with_an_empty_side_is_rejected() {
+        assert!(parse_bind(":/etc/hosts").is_err());
+        assert!(parse_bind("/etc/hosts:").is_err());
+    }
+
+    #[test]
+    fn a_bare_command_is_searched_for_along_path() {
+        // podman sends ["ls", "/"], not ["/bin/ls", "/"].
+        let env = vec!["PATH=/usr/bin:/bin".to_string()];
+        assert_eq!(
+            program_candidates("ls", &env),
+            [PathBuf::from("/usr/bin/ls"), PathBuf::from("/bin/ls")]
+        );
+    }
+
+    #[test]
+    fn a_command_with_a_slash_is_a_path_already() {
+        let env = vec!["PATH=/usr/bin".to_string()];
+        assert_eq!(program_candidates("/bin/sh", &env), [PathBuf::from("/bin/sh")]);
+        assert_eq!(program_candidates("./run.sh", &env), [PathBuf::from("./run.sh")]);
+    }
+
+    #[test]
+    fn empty_path_entries_are_skipped_rather_than_becoming_the_root() {
+        let env = vec!["PATH=/bin::/usr/bin".to_string()];
+        assert_eq!(
+            program_candidates("ls", &env),
+            [PathBuf::from("/bin/ls"), PathBuf::from("/usr/bin/ls")]
+        );
+    }
+
+    #[test]
+    fn a_bare_command_with_no_path_at_all_has_nowhere_to_look() {
+        assert!(program_candidates("ls", &[]).is_empty());
+        assert!(resolve_program("ls", &[]).is_err());
+    }
+
+    #[test]
+    fn an_empty_command_is_rejected() {
+        assert!(workload(&[]).is_err());
+    }
 }

@@ -22,11 +22,7 @@ pub const AT_RECURSIVE: u64 = 0x8000;
 /// `-errno` in the same register as the result, and no valid return lands in
 /// the last page of the address space.
 pub fn result(ret: i64) -> Result<i64, Errno> {
-    if (-4095..0).contains(&ret) {
-        Err(Errno::from_raw_os_error(-ret as i32))
-    } else {
-        Ok(ret)
-    }
+    if (-4095..0).contains(&ret) { Err(Errno::from_raw_os_error(-ret as i32)) } else { Ok(ret) }
 }
 
 /// # Safety

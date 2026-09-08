@@ -507,18 +507,19 @@ impl Config {
         }
         Ok(())
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn fixture(name: &str) -> String {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{} is a committed capture of podman's config.json: {e}", path.display()))
+        std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("{} is a committed capture of podman's config.json: {e}", path.display())
+        })
     }
 
     #[test]
@@ -654,13 +655,12 @@ mod tests {
     #[test]
     fn the_mounts_podman_sends_are_all_understood() {
         let config = Config::parse(&fixture("podman-unconfined.json")).unwrap();
-        let kinds: Vec<&str> =
-            config.mounts.iter().filter_map(|m| m.kind.as_deref()).collect();
+        let kinds: Vec<&str> = config.mounts.iter().filter_map(|m| m.kind.as_deref()).collect();
 
         assert!(kinds.contains(&"proc"));
         assert!(kinds.contains(&"devpts"), "this is where /dev/pts finally arrives");
         assert!(kinds.contains(&"cgroup"));
-        assert!(config.mounts.iter().any(|m| m.destination == PathBuf::from("/etc/resolv.conf")));
+        assert!(config.mounts.iter().any(|m| m.destination == Path::new("/etc/resolv.conf")));
     }
 
     #[test]

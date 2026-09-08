@@ -83,7 +83,7 @@ first and the rootless one added later behind it.
 
 ```rust
 trait IdMapper     { fn write_maps(&self, pid: Pid) -> Result<()>; }
-trait CgroupDriver { fn scope(&self) -> Result<PathBuf>; }
+trait CgroupDriver { fn scope(&self, controllers: &[&str]) -> Result<PathBuf>; }
 trait MountStrategy{ fn prepare(&self, rootfs: &Path) -> Result<MountPlan>; }
 ```
 
@@ -143,6 +143,13 @@ no mount created inside is visible in the host's `/proc/self/mountinfo`.
   a controller's files only exist in a cgroup if its parent enabled it, and a
   cgroup holding children cannot hold processes. So `quilt/` is a pure parent
   and `quilt/<id>` is the leaf that holds the limits and the workload
+- Enable only the controllers this container's limits are written with, not a
+  fixed set of all three. Root can enable anything, so the difference is
+  invisible until phase 6: a delegated subtree offers whatever systemd handed
+  the user session, and `cpu` delegation to `user@.service` only became the
+  default in systemd v252. Demanding `cpu` for a container that sets no CPU
+  limit refuses to run on an older machine for the sake of a file nothing was
+  going to write
 - Write `memory.max`, `memory.swap.max`, `cpu.max`, `pids.max`. The swap ceiling
   is not optional: without it the kernel swaps anonymous pages out to stay under
   `memory.max` rather than OOM-killing, and on a machine with zram the memory
@@ -390,9 +397,11 @@ Telling privilege apart is its own problem, and getting it wrong is silent.
 `geteuid()` returns 0 inside a user namespace, so a rootless runtime believes it
 is root while every write lands as the real user; and the identity id-map is not
 enough either, because an ordinary user's shell has one. Privilege over the host
-is both together. The id a rootless runtime needs for `/run/user/<uid>` and
-`user@<uid>.service` is its id *outside* the namespace, which comes from
-translating uid 0 back out through `/proc/self/uid_map`.
+is both together. The id a rootless runtime needs for `/run/user/<uid>`,
+`user@<uid>.service` and the owner of a subordinate range is its id *outside*
+the namespace, which comes from translating the inside id back out through
+`/proc/self/uid_map` — and the same for the gid through `gid_map`, since
+`newgidmap` checks the request against the outside gid.
 
 **Accepts when:** the phase-4 podman demo runs as your normal user, and
 `ps -o user` shows `nathan` outside while `id` inside shows uid 0.

@@ -34,15 +34,24 @@ fn in_initial_user_namespace() -> bool {
 /// The uid this process has *outside* its user namespace.
 ///
 /// A rootless runtime is uid 0 inside and something else outside, and the
-/// things it has to name — `/run/user/<uid>`, `user@<uid>.service` — are named
-/// for the outside id. Asking `getuid()` gets the wrong one and the failure is
-/// a permission error on a path that belongs to root.
+/// things it has to name — `/run/user/<uid>`, `user@<uid>.service`, the owner
+/// of a subordinate range — are named for the outside id. Asking `getuid()`
+/// gets the wrong one and the failure is a permission error on a path that
+/// belongs to root.
 pub fn host_uid() -> u32 {
-    let inside = rustix::process::getuid().as_raw();
-    std::fs::read_to_string("/proc/self/uid_map")
-        .ok()
-        .and_then(|map| map_outward(&map, inside))
-        .unwrap_or(inside)
+    outside_id("/proc/self/uid_map", rustix::process::getuid().as_raw())
+}
+
+/// The gid this process has outside its user namespace. See [`host_uid`]; the
+/// same reasoning applies, and `newgidmap` checks the range against this id.
+pub fn host_gid() -> u32 {
+    outside_id("/proc/self/gid_map", rustix::process::getgid().as_raw())
+}
+
+/// Falls back to the inside id, which is the right answer in the namespace the
+/// kernel booted with and the only answer available if `/proc` is unreadable.
+fn outside_id(map: &str, inside: u32) -> u32 {
+    std::fs::read_to_string(map).ok().and_then(|map| map_outward(&map, inside)).unwrap_or(inside)
 }
 
 /// One `inside outside count` row.
@@ -129,7 +138,7 @@ pub struct SubUid {
 impl SubUid {
     pub fn for_current_user() -> Result<Self> {
         let uid = host_uid();
-        let gid = rustix::process::getgid().as_raw();
+        let gid = host_gid();
         let name = username_for(uid);
 
         let uid_ranges = read_subids("/etc/subuid", name.as_deref(), uid)?;
@@ -314,10 +323,7 @@ mod tests {
             1000,
             &[IdRange { start: 100_000, count: 10 }, IdRange { start: 200_000, count: 5 }],
         );
-        assert_eq!(
-            args,
-            ["42", "0", "1000", "1", "1", "100000", "10", "11", "200000", "5"]
-        );
+        assert_eq!(args, ["42", "0", "1000", "1", "1", "100000", "10", "11", "200000", "5"]);
     }
 
     #[test]

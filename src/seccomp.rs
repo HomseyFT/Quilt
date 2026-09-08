@@ -157,8 +157,9 @@ impl Assembler {
     fn offset(&self, from: usize, target: Target) -> Result<u8> {
         let to = match target {
             Target::Next => return Ok(0),
-            Target::Label(Label(id)) => self.labels[id]
-                .ok_or_else(|| Error::msg(format!("label {id} was never placed")))?,
+            Target::Label(Label(id)) => {
+                self.labels[id].ok_or_else(|| Error::msg(format!("label {id} was never placed")))?
+            }
         };
 
         // The offset counts from the instruction after the jump.
@@ -589,7 +590,7 @@ pub fn simulate(program: &[Instruction], arch: u32, nr: u32, args: [u64; 6]) -> 
             _ if offset >= DATA_ARGS => {
                 let index = ((offset - DATA_ARGS) / 8) as usize;
                 let value = args.get(index).copied().unwrap_or(0);
-                if (offset - DATA_ARGS) % 8 == 0 {
+                if (offset - DATA_ARGS).is_multiple_of(8) {
                     value as u32
                 } else {
                     (value >> 32) as u32
@@ -707,7 +708,8 @@ pub fn compile(profile: &crate::spec::Seccomp) -> Result<Vec<Instruction>> {
     }
     if profile.listener_metadata.is_some() {
         return Err(Error::msg(
-            "config.json sets seccomp listener metadata, which goes with a listener quilt does              not connect to"
+            "config.json sets seccomp listener metadata, which goes with a listener \
+             quilt does not connect to"
                 .to_string(),
         ));
     }
@@ -887,8 +889,24 @@ mod tests {
         // belongs to. Assembling podman's 432-name profile is the test: a
         // shared exit at the end of the program does not fit.
         let program = compile(&podman_profile()).unwrap();
-        assert!(program.iter().all(|i| i.jt <= 255 && i.jf <= 255));
         assert!(program.len() > 700, "the profile should assemble to a real filter");
+
+        // The byte width is the type's, so the failure a long profile actually
+        // produces is a jump that wrapped and now lands somewhere else.
+        for (index, instruction) in program.iter().enumerate() {
+            if instruction.code != JMP_JEQ_K && instruction.code != JMP_JGE_K {
+                continue;
+            }
+            for (which, offset) in [("jt", instruction.jt), ("jf", instruction.jf)] {
+                let destination = index + 1 + offset as usize;
+                assert!(
+                    destination < program.len(),
+                    "the {which} of instruction {index} jumps to {destination}, \
+                     past the end of a {}-instruction program",
+                    program.len()
+                );
+            }
+        }
     }
 
     #[test]
@@ -1010,10 +1028,7 @@ mod tests {
 
         assert_eq!(verdict(&program, syscall_number("read").unwrap()), SECCOMP_RET_ALLOW);
         assert_eq!(verdict(&program, syscall_number("write").unwrap()), SECCOMP_RET_ALLOW);
-        assert_eq!(
-            verdict(&program, syscall_number("ptrace").unwrap()),
-            SECCOMP_RET_ERRNO | 38
-        );
+        assert_eq!(verdict(&program, syscall_number("ptrace").unwrap()), SECCOMP_RET_ERRNO | 38);
     }
 
     #[test]
@@ -1040,9 +1055,8 @@ mod tests {
         .unwrap();
         let personality = syscall_number("personality").unwrap();
 
-        let with = |value: u64| {
-            simulate(&program, AUDIT_ARCH_X86_64, personality, [value, 0, 0, 0, 0, 0])
-        };
+        let with =
+            |value: u64| simulate(&program, AUDIT_ARCH_X86_64, personality, [value, 0, 0, 0, 0, 0]);
         assert_eq!(with(0), SECCOMP_RET_ALLOW);
         assert_eq!(with(8), SECCOMP_RET_ERRNO | 38);
         assert_eq!(with(1 << 32), SECCOMP_RET_ERRNO | 38, "the high word was ignored");
@@ -1061,9 +1075,8 @@ mod tests {
         ))
         .unwrap();
         let personality = syscall_number("personality").unwrap();
-        let with = |value: u64| {
-            simulate(&program, AUDIT_ARCH_X86_64, personality, [value, 0, 0, 0, 0, 0])
-        };
+        let with =
+            |value: u64| simulate(&program, AUDIT_ARCH_X86_64, personality, [value, 0, 0, 0, 0, 0]);
 
         assert_eq!(with(0xffff_ffff), SECCOMP_RET_ALLOW);
         assert_eq!(with(0xffff_ffff_ffff_ffff), SECCOMP_RET_ERRNO | 1);
@@ -1104,9 +1117,8 @@ mod tests {
         ))
         .unwrap();
         let socket = syscall_number("socket").unwrap();
-        let with = |a: u64, c: u64| {
-            simulate(&program, AUDIT_ARCH_X86_64, socket, [a, 0, c, 0, 0, 0])
-        };
+        let with =
+            |a: u64, c: u64| simulate(&program, AUDIT_ARCH_X86_64, socket, [a, 0, c, 0, 0, 0]);
 
         assert_eq!(with(16, 9), SECCOMP_RET_ALLOW);
         assert_eq!(with(16, 0), SECCOMP_RET_ERRNO | 1);

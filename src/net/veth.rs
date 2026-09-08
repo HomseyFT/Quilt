@@ -114,8 +114,7 @@ pub fn address_for(seed: u32) -> Ipv4Addr {
 /// reply; the index is right here, and the encoder is what this phase is about.
 fn link_index(netns_sysfs: &Path, name: &str) -> Result<u32> {
     let path = netns_sysfs.join(name).join("ifindex");
-    let raw = std::fs::read_to_string(&path)
-        .context(|| format!("reading {}", path.display()))?;
+    let raw = std::fs::read_to_string(&path).context(|| format!("reading {}", path.display()))?;
     raw.trim()
         .parse()
         .map_err(|_| Error::msg(format!("{} does not hold an interface index", path.display())))
@@ -194,12 +193,7 @@ fn set_up_message(name: &str) -> Message {
     let mut message =
         Message::new(netlink::RTM_SETLINK, netlink::NLM_F_REQUEST | netlink::NLM_F_ACK);
     // ifi_change says which flag bits ifi_flags is authoritative for.
-    message.payload(&netlink::ifinfomsg(
-        netlink::AF_UNSPEC,
-        0,
-        netlink::IFF_UP,
-        netlink::IFF_UP,
-    ));
+    message.payload(&netlink::ifinfomsg(netlink::AF_UNSPEC, 0, netlink::IFF_UP, netlink::IFF_UP));
     message.attr_str(netlink::IFLA_IFNAME, name);
     message
 }
@@ -489,12 +483,9 @@ mod tests {
     fn the_bridge_message_asks_for_the_same_thing_ip_asks_for() {
         let theirs =
             netlink::parse(&golden("bridge-add.hex"), 16, &[netlink::IFLA_LINKINFO]).unwrap();
-        let ours = netlink::parse(
-            &create_bridge_message().finish(0),
-            16,
-            &[netlink::IFLA_LINKINFO],
-        )
-        .unwrap();
+        let ours =
+            netlink::parse(&create_bridge_message().finish(0), 16, &[netlink::IFLA_LINKINFO])
+                .unwrap();
 
         assert_eq!(ours.kind, theirs.kind);
         assert_eq!(ours.flags, theirs.flags);
@@ -530,10 +521,9 @@ mod tests {
         assert_ne!(theirs.payload[4..8], [0, 0, 0, 0], "ip identifies by index");
         assert_eq!(ours.payload[4..8], [0, 0, 0, 0]);
         assert!(
-            ours.attrs.iter().any(|a| matches!(
-                a,
-                netlink::Attr::Value { kind: netlink::IFLA_IFNAME, .. }
-            )),
+            ours.attrs
+                .iter()
+                .any(|a| matches!(a, netlink::Attr::Value { kind: netlink::IFLA_IFNAME, .. })),
             "quilt identifies by name"
         );
     }

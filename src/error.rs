@@ -54,9 +54,6 @@ impl<T> Context<T> for std::result::Result<T, rustix::io::Errno> {
 
 impl<T> Context<T> for std::result::Result<T, std::io::Error> {
     fn context(self, f: impl FnOnce() -> String) -> Result<T> {
-        self.map_err(|e| Error {
-            context: f(),
-            errno: rustix::io::Errno::from_io_error(&e),
-        })
+        self.map_err(|e| Error { context: f(), errno: rustix::io::Errno::from_io_error(&e) })
     }
 }

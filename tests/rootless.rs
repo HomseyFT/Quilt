@@ -59,27 +59,18 @@ fn quilt(flags: &[&str], script: &str) -> Output {
     args.push(rootfs().display().to_string());
     args.extend(["/bin/sh".to_string(), "-c".to_string(), script.to_string()]);
 
-    Command::new(env!("CARGO_BIN_EXE_quilt"))
-        .args(&args)
-        .output()
-        .expect("failed to spawn quilt")
+    Command::new(env!("CARGO_BIN_EXE_quilt")).args(&args).output().expect("failed to spawn quilt")
 }
 
 fn inside(flags: &[&str], script: &str) -> String {
     let out = quilt(flags, script);
-    assert!(
-        out.status.success(),
-        "container failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "container failed: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 fn delegated_root() -> PathBuf {
     let uid = host_uid();
-    PathBuf::from(format!(
-        "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
-    ))
+    PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"))
 }
 
 #[test]
@@ -125,10 +116,13 @@ fn the_scope_lands_in_the_subtree_systemd_delegated() {
         "the container is not in the delegated subtree: {cgroup}"
     );
 
+    // The run above created this, and make_scope never removes an ancestor, so
+    // a missing directory is a broken assumption rather than an empty result.
     let quilt_dir = delegated_root().join("quilt");
-    let leftover: Vec<PathBuf> = std::fs::read_dir(&quilt_dir)
-        .map(|entries| entries.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()).collect())
-        .unwrap_or_default();
+    let entries = std::fs::read_dir(&quilt_dir)
+        .unwrap_or_else(|e| panic!("{} should exist after a run: {e}", quilt_dir.display()));
+    let leftover: Vec<PathBuf> =
+        entries.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()).collect();
     assert!(leftover.is_empty(), "a scope outlived its container: {leftover:?}");
 }
 

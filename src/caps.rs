@@ -60,16 +60,14 @@ const CAPABILITIES: &[(&str, u32)] = &[
 const MAX_CAPABILITY: u32 = 63;
 
 fn capability_number(name: &str) -> Result<u32> {
-    CAPABILITIES
-        .iter()
-        .find(|(known, _)| *known == name)
-        .map(|(_, number)| *number)
-        .ok_or_else(|| {
+    CAPABILITIES.iter().find(|(known, _)| *known == name).map(|(_, number)| *number).ok_or_else(
+        || {
             // Not a warning. A capability quilt does not recognise is one it
             // cannot decide to withhold, and granting the rest as if the list
             // were complete is the quiet failure this phase is about.
             Error::msg(format!("config.json names a capability quilt does not know: {name}"))
-        })
+        },
+    )
 }
 
 /// Turns a list of OCI capability names into a bitmask.

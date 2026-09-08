@@ -25,7 +25,10 @@ use crate::spec;
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const PARENT: &str = "quilt";
 
-/// The controllers quilt needs enabled on the parent.
+/// Every controller quilt can write a limit for. Which of them a container
+/// actually needs comes from its [`Limits`]: asking for all three would refuse
+/// to run on a delegated subtree that was handed fewer, for the sake of files
+/// nothing was going to write.
 const CONTROLLERS: &[&str] = &["cpu", "memory", "pids"];
 
 /// The CPU accounting period, in microseconds. `cpu.max` is a quota over this.
@@ -36,46 +39,47 @@ const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const TEARDOWN_POLL: Duration = Duration::from_millis(1);
 
 pub trait CgroupDriver {
-    fn scope(&self) -> Result<PathBuf>;
+    /// Creates the scope with `controllers` enabled for it.
+    fn scope(&self, controllers: &[&str]) -> Result<PathBuf>;
+}
+
+/// Where a scope sits relative to whichever cgroup directory it is rooted at:
+/// the scope an OCI bundle names, or quilt's own `quilt/<id>` when it names
+/// none.
+///
+/// The systemd form of `cgroupsPath` is refused earlier, by
+/// `spec::Config::validate`, so anything arriving here is a plain path.
+fn relative_from_config(id: &str, cgroups_path: Option<&str>) -> Result<PathBuf> {
+    let Some(path) = cgroups_path else {
+        return Ok(Path::new(PARENT).join(id));
+    };
+
+    let relative = path.trim_start_matches('/');
+    if relative.is_empty() {
+        return Err(Error::msg(
+            "cgroupsPath is the cgroup root, which cannot hold a container".to_string(),
+        ));
+    }
+    if relative.split('/').any(|part| part == "." || part == ".." || part.is_empty()) {
+        return Err(Error::msg(format!("cgroupsPath {path:?} is not a plain path")));
+    }
+    Ok(PathBuf::from(relative))
 }
 
 /// Scopes under the unified hierarchy. Requires root.
 pub struct RootCgroup {
-    /// Where the scope sits relative to the cgroup root.
-    pub(crate) relative: PathBuf,
+    relative: PathBuf,
 }
 
 impl RootCgroup {
-    /// quilt's own layout, `quilt/<id>`, for the bespoke CLI.
-    pub fn new(id: impl Into<String>) -> Self {
-        Self { relative: Path::new(PARENT).join(id.into()) }
-    }
-
-    /// The scope an OCI bundle names, or quilt's own when it names none.
-    ///
-    /// The systemd form of `cgroupsPath` is refused earlier, by
-    /// `spec::Config::validate`, so anything arriving here is a plain path.
     pub fn from_config(id: &str, cgroups_path: Option<&str>) -> Result<Self> {
-        let Some(path) = cgroups_path else {
-            return Ok(Self::new(id));
-        };
-
-        let relative = path.trim_start_matches('/');
-        if relative.is_empty() {
-            return Err(Error::msg(
-                "cgroupsPath is the cgroup root, which cannot hold a container".to_string(),
-            ));
-        }
-        if relative.split('/').any(|part| part == "." || part == ".." || part.is_empty()) {
-            return Err(Error::msg(format!("cgroupsPath {path:?} is not a plain path")));
-        }
-        Ok(Self { relative: PathBuf::from(relative) })
+        Ok(Self { relative: relative_from_config(id, cgroups_path)? })
     }
 }
 
 impl CgroupDriver for RootCgroup {
-    fn scope(&self) -> Result<PathBuf> {
-        make_scope(Path::new(CGROUP_ROOT), &self.relative)
+    fn scope(&self, controllers: &[&str]) -> Result<PathBuf> {
+        make_scope(Path::new(CGROUP_ROOT), &self.relative, controllers)
     }
 }
 
@@ -99,13 +103,13 @@ impl Delegated {
             ))
         })?;
 
-        Ok(Self { base, relative: RootCgroup::from_config(id, cgroups_path)?.relative })
+        Ok(Self { base, relative: relative_from_config(id, cgroups_path)? })
     }
 }
 
 impl CgroupDriver for Delegated {
-    fn scope(&self) -> Result<PathBuf> {
-        make_scope(&self.base, &self.relative)
+    fn scope(&self, controllers: &[&str]) -> Result<PathBuf> {
+        make_scope(&self.base, &self.relative, controllers)
     }
 }
 
@@ -134,16 +138,17 @@ fn delegated_root(own_cgroup: &str, uid: u32) -> Option<PathBuf> {
 /// Every directory on the way has to have the controllers enabled for its
 /// children, or the leaf's limit files never appear. That failure is an ENOENT
 /// on a write much later, which says nothing about which ancestor caused it.
-fn make_scope(base: &Path, relative: &Path) -> Result<PathBuf> {
+fn make_scope(base: &Path, relative: &Path, controllers: &[&str]) -> Result<PathBuf> {
     let components: Vec<_> = relative.iter().collect();
-    let (leaf, ancestors) = components.split_last().expect("from_config rejects an empty path");
+    let (leaf, ancestors) =
+        components.split_last().expect("relative_from_config rejects an empty path");
 
     let mut dir = base.to_path_buf();
-    enable_controllers(&dir)?;
+    enable_controllers(&dir, controllers)?;
     for ancestor in ancestors {
         dir = dir.join(ancestor);
         std::fs::create_dir_all(&dir).context(|| format!("creating {}", dir.display()))?;
-        enable_controllers(&dir)?;
+        enable_controllers(&dir, controllers)?;
     }
 
     // Deliberately not create_dir_all: a directory that is already there is a
@@ -173,12 +178,16 @@ pub fn driver_for_this_user(id: &str, cgroups_path: Option<&str>) -> Result<Box<
 
 /// Turns on the controllers quilt writes limits for, so that their files exist
 /// in the leaf below. Enabling one that is already on is a no-op.
-fn enable_controllers(parent: &Path) -> Result<()> {
+fn enable_controllers(parent: &Path, controllers: &[&str]) -> Result<()> {
+    if controllers.is_empty() {
+        return Ok(());
+    }
+
     let available = std::fs::read_to_string(parent.join("cgroup.controllers"))
         .context(|| format!("reading {}/cgroup.controllers", parent.display()))?;
     let available: Vec<&str> = available.split_whitespace().collect();
 
-    if let Some(missing) = CONTROLLERS.iter().find(|c| !available.contains(c)) {
+    if let Some(missing) = controllers.iter().find(|c| !available.contains(*c)) {
         return Err(Error::msg(format!(
             "the {missing} controller is not available in {}; \
              its own parent has not enabled it in cgroup.subtree_control",
@@ -191,7 +200,7 @@ fn enable_controllers(parent: &Path) -> Result<()> {
     // already what quilt wants.
     let enabled = std::fs::read_to_string(parent.join("cgroup.subtree_control"))
         .context(|| format!("reading {}/cgroup.subtree_control", parent.display()))?;
-    let missing = missing_controllers(&enabled);
+    let missing = missing_controllers(&enabled, controllers);
     if missing.is_empty() {
         return Ok(());
     }
@@ -201,10 +210,10 @@ fn enable_controllers(parent: &Path) -> Result<()> {
         .context(|| format!("enabling {directive:?} in {}", parent.display()))
 }
 
-/// Which of the controllers quilt needs are not yet enabled for children.
-fn missing_controllers(enabled: &str) -> Vec<&'static str> {
+/// Which of the ones this container needs are not yet enabled for children.
+fn missing_controllers<'a>(enabled: &str, controllers: &[&'a str]) -> Vec<&'a str> {
     let enabled: Vec<&str> = enabled.split_whitespace().collect();
-    CONTROLLERS.iter().copied().filter(|c| !enabled.contains(c)).collect()
+    controllers.iter().copied().filter(|c| !enabled.contains(c)).collect()
 }
 
 fn subtree_control_directive(controllers: &[&str]) -> String {
@@ -263,13 +272,32 @@ impl Limits {
                 _ => None,
             },
             cpu_max: match resources.cpu.as_ref() {
-                Some(cpu) => cpu.quota.and_then(positive).map(|quota| {
-                    (quota, cpu.period.filter(|p| *p > 0).unwrap_or(CPU_PERIOD_US))
-                }),
+                Some(cpu) => cpu
+                    .quota
+                    .and_then(positive)
+                    .map(|quota| (quota, cpu.period.filter(|p| *p > 0).unwrap_or(CPU_PERIOD_US))),
                 None => None,
             },
             pids_max: resources.pids.as_ref().map(|p| p.limit).and_then(positive),
         })
+    }
+
+    /// The controllers these limits need enabled, in `CONTROLLERS` order.
+    ///
+    /// Only these: a delegated subtree offers whatever systemd handed the user
+    /// session, which on an older systemd is not all three, and a container
+    /// setting no CPU limit has no reason to care.
+    fn controllers(&self) -> Vec<&'static str> {
+        let wanted = [
+            ("cpu", self.cpu_max.is_some()),
+            ("memory", self.memory_max.is_some() || self.memory_swap_max.is_some()),
+            ("pids", self.pids_max.is_some()),
+        ];
+        CONTROLLERS
+            .iter()
+            .copied()
+            .filter(|name| wanted.iter().any(|(w, needed)| w == name && *needed))
+            .collect()
     }
 
     /// The cgroup files to write, in the order they are written.
@@ -315,23 +343,26 @@ pub struct Scope {
 }
 
 impl Scope {
-    pub fn create(driver: &dyn CgroupDriver) -> Result<Self> {
-        Ok(Self { path: driver.scope()? })
-    }
-
-
-    pub fn apply(&self, limits: &Limits) -> Result<()> {
+    /// Creates the scope and writes its limits.
+    ///
+    /// The limits are needed to create it at all — they say which controllers
+    /// have to be enabled on the way down — so there is no window in which a
+    /// scope exists without them.
+    pub fn create(driver: &dyn CgroupDriver, limits: &Limits) -> Result<Self> {
+        let scope = Self { path: driver.scope(&limits.controllers())? };
         for (file, value) in limits.files() {
-            self.write(file, &value)?;
+            scope.write(file, &value)?;
         }
-        Ok(())
+        Ok(scope)
     }
 
     /// A descriptor for `clone3`'s `CLONE_INTO_CGROUP`.
     pub fn open(&self) -> Result<OwnedFd> {
         rustix::fs::open(
             &self.path,
-            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC,
             rustix::fs::Mode::empty(),
         )
         .context(|| format!("opening {}", self.path.display()))
@@ -363,8 +394,7 @@ impl Scope {
     fn destroy(&self) -> Result<()> {
         self.write("cgroup.kill", "1")?;
         self.wait_until_empty()?;
-        std::fs::remove_dir(&self.path)
-            .context(|| format!("removing {}", self.path.display()))
+        std::fs::remove_dir(&self.path).context(|| format!("removing {}", self.path.display()))
     }
 
     fn wait_until_empty(&self) -> Result<()> {
@@ -443,8 +473,7 @@ pub fn parse_size(value: &str) -> Result<u64> {
     if size == 0 {
         return Err(Error::msg("a size must be greater than zero".to_string()));
     }
-    size.checked_mul(multiplier)
-        .ok_or_else(|| Error::msg(format!("size {value:?} overflows")))
+    size.checked_mul(multiplier).ok_or_else(|| Error::msg(format!("size {value:?} overflows")))
 }
 
 /// Reads one value out of a flat `key value` cgroup file, as used by
@@ -543,13 +572,29 @@ mod tests {
 
     #[test]
     fn nothing_is_written_when_the_controllers_are_already_on() {
-        assert!(missing_controllers("cpuset cpu io memory pids").is_empty());
+        assert!(missing_controllers("cpuset cpu io memory pids", CONTROLLERS).is_empty());
     }
 
     #[test]
     fn only_the_controllers_that_are_missing_are_enabled() {
-        assert_eq!(missing_controllers("cpu"), ["memory", "pids"]);
-        assert_eq!(missing_controllers(""), ["cpu", "memory", "pids"]);
+        assert_eq!(missing_controllers("cpu", CONTROLLERS), ["memory", "pids"]);
+        assert_eq!(missing_controllers("", CONTROLLERS), ["cpu", "memory", "pids"]);
+    }
+
+    #[test]
+    fn a_container_only_needs_the_controllers_its_limits_are_written_with() {
+        assert!(Limits::default().controllers().is_empty());
+        assert_eq!(Limits::from_cli(None, Some(0.5), None).unwrap().controllers(), ["cpu"]);
+        assert_eq!(Limits::from_cli(Some(1 << 20), None, None).unwrap().controllers(), ["memory"]);
+        assert_eq!(
+            Limits::from_cli(Some(1 << 20), Some(0.5), Some(64)).unwrap().controllers(),
+            CONTROLLERS
+        );
+    }
+
+    #[test]
+    fn a_subtree_missing_a_controller_nothing_asked_for_is_still_usable() {
+        assert!(missing_controllers("memory pids", &["memory", "pids"]).is_empty());
     }
 
     #[test]
@@ -570,9 +615,7 @@ mod tests {
         let own = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/kitty.scope\n";
         assert_eq!(
             delegated_root(own, 1000).unwrap(),
-            PathBuf::from(
-                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service"
-            )
+            PathBuf::from("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service")
         );
     }
 
@@ -634,10 +677,8 @@ mod tests {
     fn a_negative_bundle_limit_means_unlimited_and_writes_nothing() {
         // The OCI spec spells "no limit" as a negative number; writing it
         // through would put a nonsense value in the cgroup file.
-        let resources = spec::Resources {
-            pids: Some(spec::Pids { limit: -1 }),
-            ..spec::Resources::default()
-        };
+        let resources =
+            spec::Resources { pids: Some(spec::Pids { limit: -1 }), ..spec::Resources::default() };
         assert_eq!(Limits::from_oci(Some(&resources)).unwrap().pids_max, None);
     }
 
@@ -674,7 +715,11 @@ mod tests {
     #[test]
     fn a_bundle_cpu_quota_keeps_its_own_period() {
         let resources = spec::Resources {
-            cpu: Some(spec::Cpu { quota: Some(25_000), period: Some(50_000), ..Default::default() }),
+            cpu: Some(spec::Cpu {
+                quota: Some(25_000),
+                period: Some(50_000),
+                ..Default::default()
+            }),
             ..spec::Resources::default()
         };
         assert_eq!(Limits::from_oci(Some(&resources)).unwrap().cpu_max, Some((25_000, 50_000)));

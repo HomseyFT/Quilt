@@ -276,7 +276,9 @@ fn parse_attrs(bytes: &[u8], nested: &[u16]) -> Result<Vec<Attr>> {
         let len = u16::from_ne_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
         let kind = u16::from_ne_bytes(bytes[offset + 2..offset + 4].try_into().unwrap());
         if len < RTATTR_LEN || offset + len > bytes.len() {
-            return Err(Error::msg(format!("attribute {kind} claims {len} bytes it does not have")));
+            return Err(Error::msg(format!(
+                "attribute {kind} claims {len} bytes it does not have"
+            )));
         }
 
         let value = &bytes[offset + RTATTR_LEN..offset + len];
@@ -507,7 +509,10 @@ mod tests {
     #[test]
     fn ifaddrmsg_and_rtmsg_are_their_documented_sizes() {
         assert_eq!(ifaddrmsg(AF_INET, 16, 0, 3).len(), 8);
-        assert_eq!(rtmsg(AF_INET, 0, RT_TABLE_MAIN, RTPROT_BOOT, RT_SCOPE_UNIVERSE, RTN_UNICAST).len(), 12);
+        assert_eq!(
+            rtmsg(AF_INET, 0, RT_TABLE_MAIN, RTPROT_BOOT, RT_SCOPE_UNIVERSE, RTN_UNICAST).len(),
+            12
+        );
     }
 
     #[test]

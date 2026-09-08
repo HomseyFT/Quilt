@@ -4,7 +4,7 @@
 //! them with `scripts/root-tests.sh`, which builds as you and runs as root.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// Skips the test unless it was asked for explicitly.
@@ -30,10 +30,7 @@ fn quilt(flags: &[&str], script: &str) -> Output {
     args.push(rootfs().display().to_string());
     args.extend(["/bin/sh".to_string(), "-c".to_string(), script.to_string()]);
 
-    Command::new(env!("CARGO_BIN_EXE_quilt"))
-        .args(&args)
-        .output()
-        .expect("failed to spawn quilt")
+    Command::new(env!("CARGO_BIN_EXE_quilt")).args(&args).output().expect("failed to spawn quilt")
 }
 
 /// Runs `script` inside a container and returns its stdout, failing loudly if
@@ -58,11 +55,7 @@ fn scopes() -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir("/sys/fs/cgroup/quilt") else {
         return Vec::new();
     };
-    entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect()
+    entries.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()).collect()
 }
 
 /// Scopes made by `quilt run`, which names them `run-<pid>-<nanos>`.
@@ -74,9 +67,7 @@ fn scopes() -> Vec<PathBuf> {
 fn run_scopes() -> Vec<PathBuf> {
     scopes()
         .into_iter()
-        .filter(|path| {
-            path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("run-"))
-        })
+        .filter(|path| path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("run-")))
         .collect()
 }
 
@@ -85,7 +76,7 @@ fn scope_of(id: &str) -> PathBuf {
 }
 
 /// Clears anything an earlier interrupted run left under this container's name.
-fn clear_container(state_root: &PathBuf, id: &str) {
+fn clear_container(state_root: &Path, id: &str) {
     std::fs::remove_dir_all(state_root.join(id)).ok();
 
     let scope = scope_of(id);
@@ -113,11 +104,7 @@ fn spawn_running(flags: &[&str], name: &str) -> (std::process::Child, PathBuf) {
     let mut args: Vec<String> = vec!["run".into()];
     args.extend(flags.iter().map(|f| f.to_string()));
     args.push(rootfs().display().to_string());
-    args.extend([
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        format!("touch /{name}; sleep 3"),
-    ]);
+    args.extend(["/bin/sh".to_string(), "-c".to_string(), format!("touch /{name}; sleep 3")]);
 
     let child = Command::new(env!("CARGO_BIN_EXE_quilt"))
         .args(&args)
@@ -164,10 +151,8 @@ fn the_workload_is_pid_one() {
 #[test]
 fn ps_sees_only_the_containers_own_processes() {
     requires_root!();
-    let pids: Vec<i32> = inside("ps -o pid=")
-        .lines()
-        .filter_map(|line| line.trim().parse().ok())
-        .collect();
+    let pids: Vec<i32> =
+        inside("ps -o pid=").lines().filter_map(|line| line.trim().parse().ok()).collect();
 
     assert!(pids.contains(&1), "no pid 1 in {pids:?}");
     assert!(pids.len() <= 4, "the host's processes are visible: {pids:?}");
@@ -338,10 +323,7 @@ fn the_workload_is_born_inside_its_own_scope() {
     requires_root!();
     // The unified hierarchy reports one line, "0::<path>".
     let cgroup = inside("cat /proc/self/cgroup");
-    assert!(
-        cgroup.trim().starts_with("0::/quilt/run-"),
-        "pid 1 is not in a quilt scope: {cgroup}"
-    );
+    assert!(cgroup.trim().starts_with("0::/quilt/run-"), "pid 1 is not in a quilt scope: {cgroup}");
 }
 
 #[test]
@@ -383,10 +365,7 @@ fn a_memory_limit_oom_kills_the_workload() {
     let out = quilt(&["--memory", "16M"], "dd if=/dev/zero of=/dev/null bs=64M count=1");
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    let kills = stderr
-        .split("oom_kill=")
-        .nth(1)
-        .and_then(|rest| rest.trim().parse::<u64>().ok());
+    let kills = stderr.split("oom_kill=").nth(1).and_then(|rest| rest.trim().parse::<u64>().ok());
 
     assert!(matches!(kills, Some(n) if n > 0), "no OOM kill was reported: {stderr}");
 }
@@ -538,12 +517,7 @@ fn write_bundle_as(dir: &PathBuf, args: &str, process_extra: &str) -> PathBuf {
 
 /// `process_extra` and `linux_extra` are spliced into their objects, for the
 /// fields a particular test cares about.
-fn write_bundle_with(
-    dir: &PathBuf,
-    args: &str,
-    process_extra: &str,
-    linux_extra: &str,
-) -> PathBuf {
+fn write_bundle_with(dir: &PathBuf, args: &str, process_extra: &str, linux_extra: &str) -> PathBuf {
     std::fs::create_dir_all(dir).unwrap();
     let config = format!(
         r#"{{
@@ -647,11 +621,7 @@ fn quilt_oci(state_root: &PathBuf, args: &[&str]) -> Output {
 
 fn status_of(state_root: &PathBuf, id: &str) -> String {
     let out = quilt_oci(state_root, &["state", id]);
-    assert!(
-        out.status.success(),
-        "state failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "state failed: {}", String::from_utf8_lossy(&out.stderr));
     let json = String::from_utf8_lossy(&out.stdout);
     // Small enough not to want a JSON parser in the test.
     for line in json.lines() {
@@ -680,11 +650,7 @@ fn the_lifecycle_verbs_drive_a_container_from_create_to_delete() {
     assert_eq!(std::fs::read_to_string(&log).unwrap(), "", "the workload ran before start");
 
     let started = quilt_oci(&state_root, &["start", "lifecycle-test"]);
-    assert!(
-        started.status.success(),
-        "start failed: {}",
-        String::from_utf8_lossy(&started.stderr)
-    );
+    assert!(started.status.success(), "start failed: {}", String::from_utf8_lossy(&started.stderr));
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while status_of(&state_root, "lifecycle-test") != "stopped"
@@ -734,8 +700,7 @@ fn a_container_can_run_as_a_user_other_than_root() {
     quilt_oci(&state_root, &["start", "user-test"]);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while status_of(&state_root, "user-test") != "stopped" && deadline > std::time::Instant::now()
-    {
+    while status_of(&state_root, "user-test") != "stopped" && deadline > std::time::Instant::now() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
@@ -859,12 +824,8 @@ fn podman_runs_a_container_end_to_end_through_quilt() {
 fn run_with_seccomp(name: &str, args: &str, seccomp: &str) -> (String, String) {
     let work = std::env::temp_dir().join(format!("quilt-seccomp-{name}"));
     std::fs::remove_dir_all(&work).ok();
-    let bundle = write_bundle_with(
-        &work.join("bundle"),
-        args,
-        "",
-        &format!(r#""seccomp": {seccomp},"#),
-    );
+    let bundle =
+        write_bundle_with(&work.join("bundle"), args, "", &format!(r#""seccomp": {seccomp},"#));
     let state_root = work.join("state");
     let log = work.join("stdout");
     std::fs::create_dir_all(&state_root).unwrap();
