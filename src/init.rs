@@ -8,8 +8,10 @@ use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Context, Error, Result};
+use crate::exec::pointer_array;
 use crate::mount::{BindSpec, MountStrategy, OciMounts, StandardMounts};
 use crate::net::veth::{self, Endpoint};
+use crate::spec;
 
 pub struct InitSpec {
     pub rootfs: PathBuf,
@@ -66,12 +68,6 @@ fn workload(argv: &[String]) -> Result<(CString, Vec<CString>, Vec<CString>)> {
     Ok((program, argv, envp))
 }
 
-fn pointer_array(values: &[CString]) -> Vec<*const u8> {
-    let mut ptrs: Vec<*const u8> = values.iter().map(|c| c.as_ptr().cast()).collect();
-    ptrs.push(std::ptr::null());
-    ptrs
-}
-
 /// Parses the `SRC:DST` pairs `run` puts on init's command line.
 pub fn parse_bind(value: &str) -> Result<BindSpec> {
     let (source, destination) = value
@@ -116,9 +112,10 @@ pub fn exec_oci(init: OciInit) -> Result<std::convert::Infallible> {
             .context(|| format!("setting hostname to {:?}", config.hostname))?;
     }
 
-    // Before the mount plan: these go through /proc, which the plan makes
+    // After the namespaces above and before the mount plan: the writes resolve
+    // through this process's namespaces, and the plan makes /proc/sys
     // read-only.
-    apply_sysctls(&config.linux.sysctl)?;
+    apply_sysctls(&config.linux.sysctl, &config.linux.namespaces)?;
 
     // `pivot_root` is about to put the fifo out of reach by name. A directory
     // descriptor survives that, and `openat` through it needs no path.
@@ -216,12 +213,16 @@ fn signal_ready(fd: std::os::fd::RawFd) -> Result<()> {
     Ok(())
 }
 
-/// Sysctls that belong to a namespace, and so are the container's to set.
-/// Everything else reaches the whole machine.
-fn is_namespaced_sysctl(key: &str) -> bool {
-    const NAMESPACED: &[&str] = &[
-        "kernel.domainname",
-        "kernel.hostname",
+/// Which namespace a sysctl's setting lives in, if it lives in one at all.
+///
+/// The write goes through `/proc/sys`, but these entries are not served by the
+/// procfs superblock: the kernel resolves them through the *calling task's*
+/// namespaces. So the write lands wherever the caller happens to be, and a
+/// container that never asked for the namespace reconfigures the host.
+fn sysctl_namespace(key: &str) -> Option<spec::NamespaceKind> {
+    use spec::NamespaceKind::{Ipc, Network, Uts};
+
+    const IPC: &[&str] = &[
         "kernel.msgmax",
         "kernel.msgmnb",
         "kernel.msgmni",
@@ -232,17 +233,47 @@ fn is_namespaced_sysctl(key: &str) -> bool {
         "kernel.shm_rmid_forced",
     ];
 
-    key.starts_with("net.") || key.starts_with("fs.mqueue.") || NAMESPACED.contains(&key)
+    if key.starts_with("net.") {
+        Some(Network)
+    } else if key.starts_with("fs.mqueue.") || IPC.contains(&key) {
+        Some(Ipc)
+    } else if key == "kernel.hostname" || key == "kernel.domainname" {
+        Some(Uts)
+    } else {
+        None
+    }
 }
 
-fn apply_sysctls(sysctls: &std::collections::BTreeMap<String, String>) -> Result<()> {
-    for (key, value) in sysctls {
-        if !is_namespaced_sysctl(key) {
+/// Refuses a sysctl quilt would write to the host, for `create`.
+pub fn validate_sysctls(
+    sysctls: &std::collections::BTreeMap<String, String>,
+    namespaces: &[spec::Namespace],
+) -> Result<()> {
+    for key in sysctls.keys() {
+        let Some(required) = sysctl_namespace(key) else {
             return Err(Error::msg(format!(
                 "config.json sets the sysctl {key}, which is not namespaced and would \
                  reconfigure the host"
             )));
+        };
+        if !namespaces.iter().any(|namespace| namespace.kind == required) {
+            return Err(Error::msg(format!(
+                "config.json sets the sysctl {key}, which belongs to the {} namespace, but \
+                 asks for no {} namespace, so the write would land on the host",
+                required.as_str(),
+                required.as_str()
+            )));
         }
+    }
+    Ok(())
+}
+
+fn apply_sysctls(
+    sysctls: &std::collections::BTreeMap<String, String>,
+    namespaces: &[spec::Namespace],
+) -> Result<()> {
+    validate_sysctls(sysctls, namespaces)?;
+    for (key, value) in sysctls {
         let path = format!("/proc/sys/{}", key.replace('.', "/"));
         std::fs::write(&path, value)
             .context(|| format!("setting the sysctl {key} to {value:?}"))?;
@@ -276,12 +307,24 @@ fn rlimit_resource(name: &str) -> Result<rustix::process::Resource> {
     })
 }
 
-/// Checks the rlimit names without setting anything, for `create`.
-pub fn validate_rlimits(rlimits: &[crate::spec::Rlimit]) -> Result<()> {
-    rlimits.iter().try_for_each(|rlimit| rlimit_resource(&rlimit.kind).map(|_| ()))
+/// Checks the rlimits without setting anything, for `create`.
+pub fn validate_rlimits(rlimits: &[spec::Rlimit]) -> Result<()> {
+    for rlimit in rlimits {
+        rlimit_resource(&rlimit.kind)?;
+        // setrlimit answers EINVAL, which would otherwise arrive after `create`
+        // has already reported the container exists.
+        if rlimit.soft > rlimit.hard {
+            return Err(Error::msg(format!(
+                "config.json sets {} with a soft limit ({}) above its hard limit ({})",
+                rlimit.kind, rlimit.soft, rlimit.hard
+            )));
+        }
+    }
+    Ok(())
 }
 
-fn apply_rlimits(rlimits: &[crate::spec::Rlimit]) -> Result<()> {
+fn apply_rlimits(rlimits: &[spec::Rlimit]) -> Result<()> {
+    validate_rlimits(rlimits)?;
     for rlimit in rlimits {
         rustix::process::setrlimit(
             rlimit_resource(&rlimit.kind)?,
@@ -431,5 +474,53 @@ mod tests {
     #[test]
     fn an_empty_command_is_rejected() {
         assert!(workload(&[]).is_err());
+    }
+
+    fn namespaces(kinds: &[spec::NamespaceKind]) -> Vec<spec::Namespace> {
+        kinds.iter().map(|kind| spec::Namespace { kind: *kind, path: None }).collect()
+    }
+
+    fn sysctl(key: &str) -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::from([(key.to_string(), "1".to_string())])
+    }
+
+    #[test]
+    fn a_sysctl_that_is_not_namespaced_at_all_is_refused() {
+        assert!(sysctl_namespace("vm.swappiness").is_none());
+        let all = namespaces(&[
+            spec::NamespaceKind::Network,
+            spec::NamespaceKind::Ipc,
+            spec::NamespaceKind::Uts,
+        ]);
+        assert!(validate_sysctls(&sysctl("vm.swappiness"), &all).is_err());
+    }
+
+    #[test]
+    fn each_sysctl_needs_the_namespace_its_setting_lives_in() {
+        use spec::NamespaceKind::{Ipc, Network, Uts};
+        assert_eq!(sysctl_namespace("net.ipv4.ping_group_range"), Some(Network));
+        assert_eq!(sysctl_namespace("fs.mqueue.msg_max"), Some(Ipc));
+        assert_eq!(sysctl_namespace("kernel.shmmax"), Some(Ipc));
+        assert_eq!(sysctl_namespace("kernel.hostname"), Some(Uts));
+    }
+
+    #[test]
+    fn a_namespaced_sysctl_without_its_namespace_would_reach_the_host() {
+        // The whole point of the list: net.* is namespaced, which protects
+        // nothing if the container shares the host's network namespace.
+        let ipc_only = namespaces(&[spec::NamespaceKind::Ipc]);
+        assert!(validate_sysctls(&sysctl("net.ipv4.ip_forward"), &ipc_only).is_err());
+
+        let with_net = namespaces(&[spec::NamespaceKind::Network]);
+        assert!(validate_sysctls(&sysctl("net.ipv4.ip_forward"), &with_net).is_ok());
+    }
+
+    #[test]
+    fn an_rlimit_whose_soft_limit_exceeds_its_hard_limit_is_refused() {
+        let inverted = [spec::Rlimit { kind: "RLIMIT_NOFILE".to_string(), soft: 4096, hard: 1024 }];
+        assert!(validate_rlimits(&inverted).is_err());
+
+        let ordered = [spec::Rlimit { kind: "RLIMIT_NOFILE".to_string(), soft: 1024, hard: 4096 }];
+        assert!(validate_rlimits(&ordered).is_ok());
     }
 }

@@ -508,6 +508,21 @@ fn write_bundle_as(dir: &PathBuf, args: &str, process_extra: &str) -> PathBuf {
 /// `process_extra` and `linux_extra` are spliced into their objects, for the
 /// fields a particular test cares about.
 fn write_bundle_with(dir: &PathBuf, args: &str, process_extra: &str, linux_extra: &str) -> PathBuf {
+    write_bundle_in(dir, args, process_extra, linux_extra, DEFAULT_NAMESPACES)
+}
+
+const DEFAULT_NAMESPACES: &str = r#"{"type": "pid"}, {"type": "ipc"}, {"type": "uts"},
+                                    {"type": "mount"}, {"type": "network"}"#;
+
+/// As [`write_bundle_with`], but with the namespace list spelled out, for the
+/// tests that care which namespaces the container has.
+fn write_bundle_in(
+    dir: &PathBuf,
+    args: &str,
+    process_extra: &str,
+    linux_extra: &str,
+    namespaces: &str,
+) -> PathBuf {
     std::fs::create_dir_all(dir).unwrap();
     let config = format!(
         r#"{{
@@ -532,8 +547,7 @@ fn write_bundle_with(dir: &PathBuf, args: &str, process_extra: &str, linux_extra
             ],
             "linux": {{
                 {linux_extra}
-                "namespaces": [{{"type": "pid"}}, {{"type": "ipc"}}, {{"type": "uts"}},
-                               {{"type": "mount"}}, {{"type": "network"}}],
+                "namespaces": [{namespaces}],
                 "resources": {{"pids": {{"limit": 64}}}},
                 "maskedPaths": ["/proc/kcore"],
                 "readonlyPaths": ["/proc/sys"]
@@ -542,6 +556,7 @@ fn write_bundle_with(dir: &PathBuf, args: &str, process_extra: &str, linux_extra
         args = args,
         process_extra = process_extra,
         linux_extra = linux_extra,
+        namespaces = namespaces,
         rootfs = rootfs().display()
     );
     std::fs::write(dir.join("config.json"), config).unwrap();
@@ -801,15 +816,68 @@ fn podman_runs_a_container_end_to_end_through_quilt() {
     assert!(stdout.contains("etc"), "the container did not list its root: {stdout}");
 }
 
+/// The write goes through the *host's* `/proc`, because the mount plan has not
+/// run yet — but `/proc/sys/net` is resolved through the calling task's network
+/// namespace, not through the superblock it was mounted from. So the value
+/// lands in the container. Nothing else in the tree records that, and the
+/// failure if it were wrong is a container silently reconfiguring the host.
+#[test]
+fn a_namespaced_sysctl_lands_in_the_container_and_not_on_the_host() {
+    requires_root!();
+    const KEY: &str = "/proc/sys/net/ipv4/ping_group_range";
+    let before = std::fs::read_to_string(KEY).unwrap();
+
+    let (output, errors) = run_bundle(
+        "sysctl-netns",
+        r#""/bin/sh", "-c", "cat /proc/sys/net/ipv4/ping_group_range""#,
+        r#""sysctl": {"net.ipv4.ping_group_range": "100 200"},"#,
+    );
+
+    let inside: Vec<&str> = output.split_whitespace().collect();
+    assert_eq!(inside, ["100", "200"], "the container did not see its own sysctl: {errors}");
+    assert_eq!(std::fs::read_to_string(KEY).unwrap(), before, "the host's sysctl was changed");
+}
+
+/// `net.*` is namespaced, which only helps if the container is in a network
+/// namespace of its own. Without one the write reaches the host.
+#[test]
+fn a_namespaced_sysctl_is_refused_when_its_namespace_was_not_asked_for() {
+    requires_root!();
+    let work = std::env::temp_dir().join("quilt-sysctl-no-netns");
+    std::fs::remove_dir_all(&work).ok();
+    let bundle = write_bundle_in(
+        &work.join("bundle"),
+        r#""/bin/true""#,
+        "",
+        r#""sysctl": {"net.ipv4.ping_group_range": "100 200"},"#,
+        r#"{"type": "pid"}, {"type": "ipc"}, {"type": "uts"}, {"type": "mount"}"#,
+    );
+    let state_root = work.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+
+    let (ok, stderr) = try_create_container(&state_root, &bundle, "sysctl-no-netns");
+    assert!(!ok, "a net.* sysctl without a network namespace was accepted");
+    assert!(
+        stderr.contains("network namespace") && stderr.contains("land on the host"),
+        "the refusal should say why: {stderr}"
+    );
+    std::fs::remove_dir_all(&work).ok();
+}
+
 // --- Phase 5: seccomp -----------------------------------------------------
 
 /// Runs a bundle with `seccomp` as its `linux.seccomp` and returns what the
 /// workload wrote, plus init's own stderr.
 fn run_with_seccomp(name: &str, args: &str, seccomp: &str) -> (String, String) {
-    let work = std::env::temp_dir().join(format!("quilt-seccomp-{name}"));
+    run_bundle(name, args, &format!(r#""seccomp": {seccomp},"#))
+}
+
+/// Runs a bundle with `linux_extra` spliced into its `linux` object, and
+/// returns what the workload wrote plus init's own stderr.
+fn run_bundle(name: &str, args: &str, linux_extra: &str) -> (String, String) {
+    let work = std::env::temp_dir().join(format!("quilt-bundle-{name}"));
     std::fs::remove_dir_all(&work).ok();
-    let bundle =
-        write_bundle_with(&work.join("bundle"), args, "", &format!(r#""seccomp": {seccomp},"#));
+    let bundle = write_bundle_with(&work.join("bundle"), args, "", linux_extra);
     let state_root = work.join("state");
     let log = work.join("stdout");
     std::fs::create_dir_all(&state_root).unwrap();

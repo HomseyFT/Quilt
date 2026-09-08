@@ -12,6 +12,7 @@ use rustix::process::{Pid, Signal, WaitOptions};
 
 use crate::cgroup::{CgroupDriver, Limits, Scope};
 use crate::error::{Context, Error, Result};
+use crate::exec::{cstrings, pointer_array};
 use crate::idmap::IdMapper;
 use crate::mount::BindSpec;
 use crate::net::veth;
@@ -75,7 +76,7 @@ pub fn run(
     match unsafe { ns::clone3(&args) }? {
         Fork::Child => {
             drop(map_done);
-            if !wait_for_maps(&map_wait) {
+            if !wait_for_handoff(&map_wait) {
                 rustix::runtime::exit_group(EXIT_INIT_FAILED);
             }
             // Only stdio should reach the container. The pipe above is CLOEXEC,
@@ -178,30 +179,19 @@ fn container_env(spec: &RunSpec) -> Vec<String> {
     env
 }
 
-fn cstrings(values: &[String]) -> Result<Vec<CString>> {
-    values
-        .iter()
-        .map(|v| {
-            CString::new(v.as_str())
-                .map_err(|_| Error::msg(format!("argument {v:?} contains a NUL byte")))
-        })
-        .collect()
-}
-
-fn pointer_array(values: &[CString]) -> Vec<*const u8> {
-    let mut ptrs: Vec<*const u8> = values.iter().map(|c| c.as_ptr().cast()).collect();
-    ptrs.push(std::ptr::null());
-    ptrs
-}
-
-/// Blocks until the parent signals that `uid_map` and `gid_map` are written.
-/// Runs post-fork, so it allocates nothing.
-fn wait_for_maps(fd: &OwnedFd) -> bool {
+/// Blocks until one byte arrives on `fd`, and reports whether it did.
+///
+/// Two handoffs use this: the child waiting for the parent to write its id
+/// maps, and `create` waiting for init to report it survived setup. Both fail
+/// the same way, by the writer closing without writing.
+///
+/// Runs post-fork on the first, so it allocates nothing.
+fn wait_for_handoff(fd: &OwnedFd) -> bool {
     let mut byte = [0u8; 1];
     loop {
         match rustix::io::read(fd, &mut byte[..]) {
             Ok(1) => return true,
-            // Zero means the parent closed the pipe without writing: it failed.
+            // Zero means the writer closed without writing: it failed.
             Ok(_) => return false,
             Err(rustix::io::Errno::INTR) => continue,
             Err(_) => return false,
@@ -582,6 +572,7 @@ pub fn create(
         crate::caps::validate(capabilities)?;
     }
     crate::init::validate_rlimits(&config.process.rlimits)?;
+    crate::init::validate_sysctls(&config.linux.sysctl, &config.linux.namespaces)?;
 
     let namespaces = Namespaces::to_create(&config.linux.namespaces)?;
     if namespaces.user {
@@ -650,7 +641,7 @@ pub fn create(
         Fork::Parent(child) => {
             drop(ready_write);
 
-            if !wait_for_maps(&ready_read) {
+            if !wait_for_handoff(&ready_read) {
                 // init already said what went wrong on stderr.
                 kill_and_reap(child);
                 return Err(Error::msg(format!("container {id} failed to start")));

@@ -5,7 +5,8 @@ where it is going.
 
 All six phases are done: namespaces, mount setup, `pivot_root`, cgroup v2
 limits, hand-assembled rtnetlink for veth networking, the OCI runtime interface,
-a hand-assembled classic-BPF seccomp filter, and rootless operation.
+a hand-assembled classic-BPF seccomp assembler for the profiles a bundle sends,
+and rootless operation.
 
 ## Build
 
@@ -19,25 +20,33 @@ cargo build --release
 
 ```sh
 scripts/make-rootfs.sh                 # populates ./rootfs from alpine
-sudo ./target/release/quilt run ./rootfs /bin/sh
+./target/release/quilt run ./rootfs /bin/sh
 ```
 
-Root is required until phase 6: the identity id-map needs `CAP_SETUID` in the
-parent user namespace.
+As root the id map is the identity; as an ordinary user it comes from
+`/etc/subuid` through `newuidmap`, and the container's root is you.
 
 ```
 quilt run [--hostname NAME] [--ro SRC[:DST]]...
           [--memory SIZE] [--cpus N] [--pids N]
-          [--net none|bridge]
+          [--net none|bridge|pasta]
           <ROOTFS> <COMMAND>...
 ```
+
+`run` is a demo of namespaces, mounts and cgroups, not a sandbox. It installs
+no seccomp filter and drops no capabilities: quilt writes no policy of its own,
+and the only filters and capability sets it applies are the ones a bundle asks
+for, on the OCI path below.
 
 `--memory` covers swap as well as memory, so the ceiling cannot be escaped by
 swapping. The OCI spec separates the two, and phase 4 honours that split.
 
 `--net bridge` puts the container on a shared `quilt0` bridge with NAT for
-egress. It is deliberately outside the OCI path — the runtime spec does not
-cover networking — so it exists on this CLI only.
+egress, and needs root: creating a link and adding a NAT rule are privileged
+however the id map is written. `--net pasta` does the same job from user space
+and is what an unprivileged container uses. Both are deliberately outside the
+OCI path — the runtime spec does not cover networking — so they exist on this
+CLI only.
 
 It changes host state that outlives the container: `quilt0`, an nftables table
 called `quilt`, and `net.ipv4.ip_forward`, which it sets to 1 and does not set
@@ -81,6 +90,8 @@ scripts/root-tests.sh       # the privileged path; builds as you, runs as root
 
 `scripts/root-tests.sh` will ask for your sudo password.
 
-The netlink golden tests compare against captures of what `ip` puts on the wire.
-They skip until those exist; `sudo scripts/capture-netlink.sh` records them into
-`tests/golden/`, and they are meant to be committed.
+The netlink golden tests compare against captures of what `ip` puts on the
+wire, committed under `tests/golden/`. A missing capture fails the test rather
+than skipping it — it means a broken checkout, not an absent option.
+`sudo scripts/capture-netlink.sh` re-records them when the message builders
+change.

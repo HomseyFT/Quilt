@@ -59,6 +59,7 @@ rest of the table: the syscall is ours, the sequencing is ours.
 src/
   main.rs           CLI dispatch
   error.rs          error type carrying the errno
+  exec.rs           argv/envp marshalling for execve
   syscall.rs        raw x86-64 syscalls rustix does not wrap
   spec.rs           OCI config.json types                    (phase 4)
   container.rs      lifecycle state machine, state on disk
@@ -67,7 +68,7 @@ src/
   idmap.rs          IdMapper trait — Identity | SubUid
   cgroup.rs         CgroupDriver trait — RootCgroup | Delegated
   mount.rs          MountPlan: pivot_root, procfs, sysfs, /dev, ro binds
-  seccomp.rs        classic-BPF assembler + default policy
+  seccomp.rs        classic-BPF assembler, compiling linux.seccomp
   caps.rs           bounding set, no_new_privs
   net/
     mod.rs          the --net modes
@@ -345,14 +346,23 @@ A hand-assembled classic-BPF filter, no library.
   return, which costs eight bytes and assembles
 - Architecture check first — validate `AUDIT_ARCH_X86_64` before reading the
   syscall number, or a 32-bit caller walks straight through the filter
-- Default-deny with an allowlist, `SECCOMP_RET_ERRNO` over `KILL` so failures
-  are debuggable, and `--seccomp-log` to put every denial in the audit log
+- `SECCOMP_RET_ERRNO` over `KILL` where a profile leaves the choice open, so
+  failures are debuggable, and `--seccomp-log` to put every denial in the audit
+  log
 - Syscall names the architecture does not have are skipped rather than refused.
   79 of the 432 podman sends are 32-bit or x32 spellings like `chown32`; they
   cannot be called here, and a caller from the architecture that has them is
   killed by the check above
 - Honour the `linux.seccomp` section of `config.json`, which is what removes
   `--security-opt seccomp=unconfined` from the phase 4 demo
+
+quilt writes no policy of its own. Every filter it installs is one a bundle
+asked for, and the same goes for capabilities, so both apply on the OCI path
+only. `quilt run` is a demo of namespaces, mounts and cgroups: it installs no
+filter and drops no capabilities, and its workload holds everything the user
+namespace grants. Inventing a default profile would mean quilt deciding what a
+sensible container is, which is what the OCI path exists to avoid — but it does
+mean the bespoke CLI is not a sandbox, and the README says so.
 
 **Accepts when:** a denied syscall returns an errno rather than killing the
 process, podman's real profile compiles and decides every rule the way it is

@@ -2,6 +2,7 @@ mod caps;
 mod cgroup;
 mod container;
 mod error;
+mod exec;
 mod idmap;
 mod init;
 mod mount;

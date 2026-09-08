@@ -34,7 +34,8 @@ purge() {
         done
         rmdir /sys/fs/cgroup/quilt 2>/dev/null
 
-        rm -rf /tmp/quilt-oci-* /tmp/quilt-seccomp-* /tmp/quilt-ro-* \
+        rm -rf /tmp/quilt-oci-* /tmp/quilt-bundle-* /tmp/quilt-seccomp-* \
+               /tmp/quilt-sysctl-* /tmp/quilt-ro-* \
                /tmp/quilt-ifindex-test /tmp/quilt-nl-*.pcap /run/quilt
 
         for link in /sys/class/net/qv*; do

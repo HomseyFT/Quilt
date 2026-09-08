@@ -232,6 +232,21 @@ pub enum NamespaceKind {
     Time,
 }
 
+impl NamespaceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pid => "pid",
+            Self::Network => "network",
+            Self::Mount => "mount",
+            Self::Ipc => "ipc",
+            Self::Uts => "uts",
+            Self::User => "user",
+            Self::Cgroup => "cgroup",
+            Self::Time => "time",
+        }
+    }
+}
+
 /// Nothing reads the rows: they exist so a bundle carrying them parses far
 /// enough to be refused with a useful message.
 #[derive(Debug, Deserialize)]
