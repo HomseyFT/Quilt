@@ -1,9 +1,8 @@
 //! Container networking.
 //!
-//! Out of the OCI path on purpose. The runtime spec does not cover networking:
+//! Out of the OCI path on purpose: the runtime spec does not cover networking.
 //! `runc` and `crun` create or join a network namespace and stop there, and
-//! podman wires it up with netavark afterwards. So this hangs off the bespoke
-//! `run` CLI only, and phase 4 leaves it alone.
+//! podman wires it up with netavark afterwards. This hangs off `run` only.
 
 pub mod netlink;
 pub mod veth;

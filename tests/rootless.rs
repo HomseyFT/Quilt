@@ -1,12 +1,11 @@
 //! Phase 6: the same runtime, driven by an unprivileged user.
 //!
-//! Gated behind `QUILT_TEST_ROOTLESS=1` because these create cgroups and
-//! containers in the invoking user's session, which a plain `cargo test` on
-//! every save should not do. Run them with `scripts/rootless-tests.sh`.
+//! Gated behind `QUILT_TEST_ROOTLESS=1`, since these create cgroups and
+//! containers in the invoking user's session. Run them with
+//! `scripts/rootless-tests.sh`.
 //!
-//! Deliberately not part of the root tier: every seam here picks its second
-//! implementation precisely because the caller is *not* root, so running these
-//! under sudo would exercise the other half.
+//! Not part of the root tier: every seam picks its second implementation
+//! because the caller is *not* root, so sudo would exercise the other half.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -76,7 +75,6 @@ fn delegated_root() -> PathBuf {
 #[test]
 fn an_unprivileged_user_gets_a_container_whose_root_is_root() {
     requires_rootless!();
-    // The whole point of the phase: uid 0 inside, an ordinary user outside.
     let id = inside(&[], "id -u");
     assert_eq!(id.trim(), "0");
 }
@@ -84,8 +82,7 @@ fn an_unprivileged_user_gets_a_container_whose_root_is_root() {
 #[test]
 fn the_containers_root_is_the_invoking_user_on_the_host() {
     requires_rootless!();
-    // The map is the proof, and it is what `newuidmap` was asked for: 0 inside
-    // is this user outside, and the subordinate range follows.
+    // 0 inside is this user outside, and the subordinate range follows.
     let map = inside(&[], "cat /proc/self/uid_map");
     let mut rows = map.lines();
 
@@ -138,8 +135,7 @@ fn a_resource_limit_still_applies_without_privilege() {
 fn bridge_networking_is_refused_with_the_flag_that_works_instead() {
     requires_rootless!();
     // A veth and a NAT rule need CAP_NET_ADMIN on the host, which no user
-    // namespace confers. Saying so, and saying what does work, beats failing
-    // somewhere inside netlink.
+    // namespace confers. The error should say so, and name what does work.
     let out = quilt(&["--net", "bridge"], "true");
     let stderr = String::from_utf8_lossy(&out.stderr);
 
@@ -179,7 +175,7 @@ fn a_rootless_container_reaches_the_internet_through_pasta() {
 #[test]
 fn podman_drives_quilt_without_sudo_anywhere() {
     requires_rootless!();
-    // The phase 6 acceptance criterion: the phase 4 demo, as an ordinary user.
+    // The phase 6 acceptance criterion: the podman demo, as an ordinary user.
     if !Command::new("podman")
         .args(["image", "exists", "alpine"])
         .status()

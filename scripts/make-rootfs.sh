@@ -1,5 +1,5 @@
 #!/bin/sh
-# Export an image's root filesystem into ./rootfs for the phase 1 demo.
+# Export an image's root filesystem into ./rootfs for the demo.
 # Pulling is podman's job, not quilt's: see the non-goals in SPEC.md.
 set -eu
 

@@ -322,9 +322,16 @@ tests, so "every field podman sends is named by a struct" stays a checked claim.
 
 Root-only at this phase, hence `sudo podman`.
 
-**Accepts when:** podman runs a container end to end through quilt, and the
-`opencontainers/runtime-tools` validation suite passes its namespace, cgroup
-and mount groups.
+**Accepts when:** podman runs a container end to end through quilt, and every
+field in the bundles podman really sends is named by a struct.
+
+The `opencontainers/runtime-tools` suite was the original bar here and is not
+used. Its `validate` half checks a config.json against the spec, which grades
+podman rather than quilt; its `validation/` half does drive a runtime, but it is
+a Go test suite against generated bundles, and quilt refuses fields it does not
+implement rather than ignoring them, so most of what it generates is a refusal
+by design. The committed fixtures are the check that survived: real bundles,
+`deny_unknown_fields`, and the podman end-to-end test.
 
 ### Phase 5 — seccomp
 
@@ -419,11 +426,13 @@ Four tiers, mirroring how QuinLang and Finance are already tested.
 capability set arithmetic, jump-offset resolution in the BPF assembler. No root,
 runs on every save.
 
-**Golden bytes.** The two encoders emit bytes, so they get pinned against a
-reference implementation:
+**Golden bytes.** What quilt encodes gets pinned against a reference:
 
-- seccomp: diff against libseccomp's output for the same policy (as a dev-only
-  comparison, not a dependency)
+- seccomp: not bytes. libseccomp sorts the syscall set into a binary-search jump
+  tree and quilt emits rules in profile order, so matching it would pin its
+  optimiser's style rather than catch anything. The filter is run instead:
+  `simulate` is a classic-BPF interpreter, and the tests assemble podman's
+  432-name profile and assert on the verdict for each rule
 - config.json: the bundles podman really produces, committed under
   `tests/fixtures/` and parsed by the unit tests. `deny_unknown_fields` turns
   that into a completeness check rather than a smoke test
@@ -432,8 +441,8 @@ reference implementation:
   `src/net/veth.rs` beside the message builders, which are split from the
   senders so a message can be built and inspected without a socket
 
-This is the tier that catches a filter that is subtly wrong but still loads —
-the failure mode that manual testing never finds.
+This is the tier that catches an encoder that is subtly wrong but still
+accepted — the failure mode that manual testing never finds.
 
 **Rootless integration.** Gated behind `QUILT_TEST_ROOTLESS=1`, and refuses to
 run as root. Every seam picks its second implementation precisely because the
@@ -443,8 +452,13 @@ caller is unprivileged, so this is the only tier that exercises those halves.
 stays safe. Asserts on observable behaviour: PID 1 inside, OOM kill fires, mount
 namespace does not leak.
 
-**External validation.** `oci-runtime-tool validate` from phase 4 onward, and
-the podman demo itself as the end-to-end check.
+**External validation.** The podman demo itself, driven by `podman --runtime`
+in both the root and rootless tiers.
+
+CI runs what can run unattended: `cargo fmt --check`, `cargo clippy
+--all-targets -D warnings`, and `cargo test --bins`. Clippy compiles the root
+and rootless binaries without running them, so those tiers still fail on a type
+error. They are not run in CI, because a gated test that skips reports a pass.
 
 ## Risks
 

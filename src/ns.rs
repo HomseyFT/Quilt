@@ -1,8 +1,7 @@
 //! Namespace flags and the `clone3` call that creates them.
 //!
-//! `rustix` deliberately does not wrap `clone3` (see its `not_implemented!`
-//! list), so the syscall is issued here by hand. That is on-theme: the shape of
-//! `struct clone_args` is the interface this project exists to learn.
+//! `rustix` does not wrap `clone3` (see its `not_implemented!` list), so the
+//! syscall is issued here by hand.
 
 use crate::error::{Context, Error, Result};
 use crate::spec::{Namespace, NamespaceKind};
@@ -36,16 +35,14 @@ pub struct Namespaces {
 }
 
 impl Namespaces {
-    /// The phase 1 set: everything the spec lists, minus the cgroup namespace,
-    /// which only becomes interesting once phase 2 has a scope to hide.
+    /// Everything the bespoke CLI creates.
     pub const DEFAULT: Self =
         Self { mount: true, pid: true, net: true, uts: true, ipc: true, user: true, cgroup: false };
 
     pub fn clone_flags(&self) -> u64 {
         let mut flags = 0;
-        // CLONE_NEWUSER is listed first only for readability; the kernel creates
-        // the user namespace first regardless, which is what lets an
-        // unprivileged caller ask for the rest in the same call.
+        // The kernel creates the user namespace first regardless of order,
+        // which is what lets an unprivileged caller ask for the rest here too.
         if self.user {
             flags |= CLONE_NEWUSER;
         }
@@ -87,11 +84,9 @@ const ENTRY_ORDER: &[NamespaceKind] = &[
 ];
 
 impl Namespaces {
-    /// The namespaces a bundle asks to be created.
-    ///
-    /// One given by path is joined instead, and must not also appear in the
-    /// clone flags: asking for both would make a fresh namespace and then
-    /// abandon it, which looks like it worked.
+    /// The namespaces a bundle asks to be created. One given by path is joined
+    /// instead, and must not also appear in the clone flags, or the fresh
+    /// namespace is made and then abandoned.
     pub fn to_create(namespaces: &[Namespace]) -> Result<Self> {
         let mut set = Self {
             mount: false,
@@ -192,15 +187,12 @@ impl CloneArgs {
         Self { flags, exit_signal: SIGCHLD, ..Self::default() }
     }
 
-    /// Puts the child in `cgroup` at birth.
+    /// Puts the child in `cgroup` at birth. Cloning first and writing the pid
+    /// to `cgroup.procs` after leaves a window in which the workload runs under
+    /// no limits, which a fork bomb reaches.
     ///
-    /// The alternative — clone, then write the child's pid to `cgroup.procs` —
-    /// leaves a window in which the workload is running under no limits at all.
-    /// That window is not hypothetical for a fork bomb or a large allocation in
-    /// the first milliseconds.
-    ///
-    /// This is why `CloneArgs` is `CLONE_ARGS_SIZE_VER2`: 88 bytes is exactly
-    /// the version that added the `cgroup` member.
+    /// `CLONE_ARGS_SIZE_VER2` exists for this: 88 bytes is the version that
+    /// added the `cgroup` member.
     pub fn into_cgroup(mut self, cgroup: BorrowedFd<'_>) -> Self {
         self.flags |= CLONE_INTO_CGROUP;
         self.cgroup = cgroup.as_raw_fd() as u64;
@@ -233,8 +225,8 @@ pub unsafe fn clone3(args: &CloneArgs) -> Result<Fork> {
         )
     };
 
-    // The errno stays structured: EPERM means user namespaces are off, EUSERS
-    // means the nesting limit, and phase 4 has to tell those apart.
+    // Kept structured: EPERM means user namespaces are off, EUSERS means the
+    // nesting limit, and callers tell those apart.
     let pid = syscall::result(ret)
         .context(|| format!("clone3 with namespace flags {:#x}", args.flags))?;
 
@@ -283,8 +275,8 @@ mod tests {
 
     #[test]
     fn a_namespace_given_by_path_is_not_also_created() {
-        // podman pre-creates the netns and passes its path. Cloning a fresh one
-        // as well would leave the container in a namespace nobody wired up.
+        // podman pre-creates the netns and passes its path; a fresh one would
+        // leave the container in a namespace nobody wired up.
         let set = Namespaces::to_create(&[
             namespace(NamespaceKind::Pid, None),
             namespace(NamespaceKind::Network, Some("/run/netns/abc")),

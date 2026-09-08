@@ -1,18 +1,14 @@
 //! cgroup v2 scopes and resource limits.
 //!
-//! The third of the spec's seams. `RootCgroup` owns a subtree of the host's
-//! unified hierarchy; phase 6 adds `Delegated`, which resolves the scope
-//! systemd already hands to the user session instead.
-//!
-//! Two structural rules of cgroup v2 shape the layout below, and both surface
-//! as a bare ENOENT or EBUSY rather than anything readable:
+//! Two structural rules shape the layout, and both surface as a bare ENOENT or
+//! EBUSY:
 //!
 //! 1. A controller's files only appear in a cgroup if its *parent* enabled the
 //!    controller in `cgroup.subtree_control` first.
 //! 2. A cgroup with children cannot hold processes of its own.
 //!
 //! So `quilt/` is a pure parent that enables controllers and holds no tasks,
-//! and each container gets a leaf `quilt/<id>` that holds the limits and the
+//! and each container gets a leaf `quilt/<id>` holding the limits and the
 //! workload.
 
 use std::os::fd::OwnedFd;
@@ -25,10 +21,8 @@ use crate::spec;
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const PARENT: &str = "quilt";
 
-/// Every controller quilt can write a limit for. Which of them a container
-/// actually needs comes from its [`Limits`]: asking for all three would refuse
-/// to run on a delegated subtree that was handed fewer, for the sake of files
-/// nothing was going to write.
+/// Every controller quilt can write a limit for. Which of them a given
+/// container needs comes from its [`Limits`].
 const CONTROLLERS: &[&str] = &["cpu", "memory", "pids"];
 
 /// The CPU accounting period, in microseconds. `cpu.max` is a quota over this.
@@ -43,12 +37,11 @@ pub trait CgroupDriver {
     fn scope(&self, controllers: &[&str]) -> Result<PathBuf>;
 }
 
-/// Where a scope sits relative to whichever cgroup directory it is rooted at:
-/// the scope an OCI bundle names, or quilt's own `quilt/<id>` when it names
-/// none.
+/// The scope an OCI bundle names, or quilt's own `quilt/<id>` when it names
+/// none, relative to whichever directory it is rooted at.
 ///
-/// The systemd form of `cgroupsPath` is refused earlier, by
-/// `spec::Config::validate`, so anything arriving here is a plain path.
+/// `spec::Config::validate` has already refused the systemd form of
+/// `cgroupsPath`, so anything arriving here is a plain path.
 fn relative_from_config(id: &str, cgroups_path: Option<&str>) -> Result<PathBuf> {
     let Some(path) = cgroups_path else {
         return Ok(Path::new(PARENT).join(id));
@@ -115,9 +108,8 @@ impl CgroupDriver for Delegated {
 
 /// The point in this process's own cgroup path where systemd stops owning it.
 ///
-/// Read rather than constructed: `user@<uid>.service` is where systemd hands
-/// the subtree over, and taking it from `/proc/self/cgroup` means the layout
-/// above it can be whatever this machine's systemd decided.
+/// Read rather than constructed, so the layout above `user@<uid>.service` can
+/// be whatever this machine's systemd decided.
 fn delegated_root(own_cgroup: &str, uid: u32) -> Option<PathBuf> {
     // A cgroup v2 line is `0::<path>`; there is only ever one.
     let path = own_cgroup.lines().find_map(|line| line.strip_prefix("0::"))?;
@@ -135,9 +127,9 @@ fn delegated_root(own_cgroup: &str, uid: u32) -> Option<PathBuf> {
 
 /// Creates the leaf, and everything between `base` and it.
 ///
-/// Every directory on the way has to have the controllers enabled for its
-/// children, or the leaf's limit files never appear. That failure is an ENOENT
-/// on a write much later, which says nothing about which ancestor caused it.
+/// Every directory on the way needs the controllers enabled for its children,
+/// or the leaf's limit files never appear — an ENOENT on a write much later,
+/// naming no ancestor.
 fn make_scope(base: &Path, relative: &Path, controllers: &[&str]) -> Result<PathBuf> {
     let components: Vec<_> = relative.iter().collect();
     let (leaf, ancestors) =
@@ -151,10 +143,9 @@ fn make_scope(base: &Path, relative: &Path, controllers: &[&str]) -> Result<Path
         enable_controllers(&dir, controllers)?;
     }
 
-    // Deliberately not create_dir_all: a directory that is already there is a
-    // scope some earlier run left behind, and its limit files are not this
-    // container's. Reusing it would silently apply them, because `Limits::files`
-    // only writes the limits that were actually asked for.
+    // Not create_dir_all: a directory already there is an earlier run's scope,
+    // and `Limits::files` writes only what was asked for, so reusing it would
+    // leave that run's limits in place.
     let scope = dir.join(leaf);
     match std::fs::create_dir(&scope) {
         Ok(()) => Ok(scope),
@@ -166,8 +157,8 @@ fn make_scope(base: &Path, relative: &Path, controllers: &[&str]) -> Result<Path
     }
 }
 
-/// The driver for whoever is running: root writes under the cgroup root, and
-/// anyone else writes in the subtree systemd delegated to their session.
+/// Root writes under the cgroup root; anyone else writes in the subtree
+/// systemd delegated to their session.
 pub fn driver_for_this_user(id: &str, cgroups_path: Option<&str>) -> Result<Box<dyn CgroupDriver>> {
     if crate::idmap::has_host_privilege() {
         Ok(Box::new(RootCgroup::from_config(id, cgroups_path)?))
@@ -176,8 +167,8 @@ pub fn driver_for_this_user(id: &str, cgroups_path: Option<&str>) -> Result<Box<
     }
 }
 
-/// Turns on the controllers quilt writes limits for, so that their files exist
-/// in the leaf below. Enabling one that is already on is a no-op.
+/// Turns on `controllers` for `parent`'s children, so their files exist in the
+/// leaf below.
 fn enable_controllers(parent: &Path, controllers: &[&str]) -> Result<()> {
     if controllers.is_empty() {
         return Ok(());
@@ -195,9 +186,8 @@ fn enable_controllers(parent: &Path, controllers: &[&str]) -> Result<()> {
         )));
     }
 
-    // Only the ones that are not on yet. The cgroup root belongs to systemd on
-    // this machine, and there is no reason to write to it when the answer is
-    // already what quilt wants.
+    // Only the ones not on yet: the cgroup root belongs to systemd, and there
+    // is no reason to write to it when the answer is already right.
     let enabled = std::fs::read_to_string(parent.join("cgroup.subtree_control"))
         .context(|| format!("reading {}/cgroup.subtree_control", parent.display()))?;
     let missing = missing_controllers(&enabled, controllers);
@@ -222,10 +212,9 @@ fn subtree_control_directive(controllers: &[&str]) -> String {
 
 /// What to write into the scope. `None` leaves the cgroup default, `max`.
 ///
-/// These are the cgroup files themselves rather than a friendlier shape,
-/// because two callers translate onto them and they disagree: the bespoke CLI
-/// takes `--cpus 0.5`, while an OCI bundle gives a quota and a period. Keeping
-/// the translation at the edges leaves one thing to test here.
+/// Shaped as the cgroup files rather than something friendlier: the CLI takes
+/// `--cpus 0.5` and a bundle gives a quota and a period, so the translation
+/// stays at the edges.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Limits {
     pub memory_max: Option<u64>,
@@ -238,10 +227,10 @@ pub struct Limits {
 impl Limits {
     /// From the bespoke CLI's flags.
     ///
-    /// `--memory` covers swap as well: without that the kernel swaps anonymous
-    /// pages out to stay under `memory.max` rather than OOM-killing, and on a
-    /// machine with zram the ceiling is not a ceiling. The OCI path keeps the
-    /// two apart, because the spec does.
+    /// `--memory` covers swap too: otherwise the kernel swaps anonymous pages
+    /// out to stay under `memory.max` instead of OOM-killing, and on a machine
+    /// with zram the ceiling is not one. OCI keeps the two apart, so the OCI
+    /// path does too.
     pub fn from_cli(memory: Option<u64>, cpus: Option<f64>, pids: Option<u64>) -> Result<Self> {
         Ok(Self {
             memory_max: memory,
@@ -262,9 +251,8 @@ impl Limits {
 
         Ok(Self {
             memory_max,
-            // The spec's `swap` is the combined memory+swap ceiling, while the
-            // kernel file is swap alone. A negative value means unlimited, which
-            // is the default, so nothing is written.
+            // The spec's `swap` is the memory+swap ceiling; the kernel file is
+            // swap alone. Negative means unlimited, which is the default.
             memory_swap_max: match (memory.and_then(|m| m.swap), memory_max) {
                 (Some(total), Some(limit)) if total >= 0 => {
                     Some((total as u64).saturating_sub(limit))
@@ -285,8 +273,7 @@ impl Limits {
     /// The controllers these limits need enabled, in `CONTROLLERS` order.
     ///
     /// Only these: a delegated subtree offers whatever systemd handed the user
-    /// session, which on an older systemd is not all three, and a container
-    /// setting no CPU limit has no reason to care.
+    /// session, which before systemd v252 does not include `cpu`.
     fn controllers(&self) -> Vec<&'static str> {
         let wanted = [
             ("cpu", self.cpu_max.is_some()),
@@ -324,10 +311,9 @@ fn positive(value: i64) -> Option<u64> {
     (value >= 0).then_some(value as u64)
 }
 
-/// A scope id unique to this invocation.
-///
-/// The pid alone is not enough. Pids recycle, and a scope a previous run left
-/// behind would then be reused by a run that asked for different limits.
+/// A scope id unique to this invocation. The pid alone is not enough: pids
+/// recycle, and a leaked scope would then be reused by a run asking for
+/// different limits.
 pub fn run_id() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -336,18 +322,16 @@ pub fn run_id() -> String {
     format!("run-{}-{nanos}", std::process::id())
 }
 
-/// A live cgroup scope. Removing it is the `Drop`, so it happens on the error
+/// A live cgroup scope. Removal is the `Drop`, so it happens on the error
 /// paths too.
 pub struct Scope {
     path: PathBuf,
 }
 
 impl Scope {
-    /// Creates the scope and writes its limits.
-    ///
-    /// The limits are needed to create it at all — they say which controllers
-    /// have to be enabled on the way down — so there is no window in which a
-    /// scope exists without them.
+    /// Creates the scope and writes its limits. The limits are needed to
+    /// create it at all, since they say which controllers to enable on the way
+    /// down.
     pub fn create(driver: &dyn CgroupDriver, limits: &Limits) -> Result<Self> {
         let scope = Self { path: driver.scope(&limits.controllers())? };
         for (file, value) in limits.files() {
@@ -386,11 +370,10 @@ impl Scope {
     /// Kills whatever is left in the scope, waits for it to empty, and removes
     /// the directory.
     ///
-    /// `waitpid` returns as soon as pid 1 is reaped, but the kernel kills the
-    /// rest of that pid namespace asynchronously and reparents the survivors to
-    /// host init. An `rmdir` issued straight after the wait races that teardown
-    /// and loses with EBUSY, leaking the scope. `cgroup.kill` (5.14+) plus
-    /// `cgroup.events:populated` turns the race into something to wait on.
+    /// `waitpid` returns as soon as pid 1 is reaped, but the kernel tears down
+    /// the rest of that pid namespace asynchronously, so an `rmdir` straight
+    /// after the wait races it and loses with EBUSY. `cgroup.kill` (5.14+) plus
+    /// `cgroup.events:populated` makes the race something to wait on.
     fn destroy(&self) -> Result<()> {
         self.write("cgroup.kill", "1")?;
         self.wait_until_empty()?;
@@ -422,18 +405,15 @@ impl Scope {
         &self.path
     }
 
-    /// Hands back the path and disarms the guard.
-    ///
-    /// The OCI lifecycle owns a scope across separate processes: `create`
-    /// builds it and exits, and only `delete` may take it away.
+    /// Hands back the path and disarms the guard, for the OCI lifecycle: it
+    /// owns a scope across processes, and only `delete` may take it away.
     pub fn keep(self) -> PathBuf {
         let path = self.path.clone();
         std::mem::forget(self);
         path
     }
 
-    /// Picks up a scope an earlier `create` left behind, so that dropping this
-    /// tears it down.
+    /// The inverse of [`Scope::keep`]: dropping the result tears the scope down.
     pub fn adopt(path: PathBuf) -> Self {
         Self { path }
     }
@@ -441,8 +421,8 @@ impl Scope {
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        // A destructor cannot return an error, but a leaked scope is worth
-        // saying out loud rather than discarding.
+        // A destructor cannot return an error, and a leaked scope is worth
+        // saying out loud.
         if let Err(e) = self.destroy() {
             eprintln!("quilt: {e}");
         }
@@ -621,8 +601,7 @@ mod tests {
 
     #[test]
     fn a_process_outside_a_user_service_has_nothing_delegated_to_it() {
-        // A system service, or a session that systemd is not managing. Saying
-        // so beats writing into a subtree that belongs to something else.
+        // A system service, or a session systemd is not managing.
         assert_eq!(delegated_root("0::/system.slice/sshd.service\n", 1000), None);
         assert_eq!(delegated_root("", 1000), None);
     }
@@ -647,8 +626,7 @@ mod tests {
 
     #[test]
     fn a_run_id_is_not_just_the_pid() {
-        // Two runs a moment apart must not land on the same scope, or the
-        // second inherits the first's limit files.
+        // Two runs a moment apart must not land on the same scope.
         let (first, second) = (run_id(), run_id());
         assert_ne!(first, second);
         assert!(first.starts_with(&format!("run-{}-", std::process::id())));
@@ -675,8 +653,7 @@ mod tests {
 
     #[test]
     fn a_negative_bundle_limit_means_unlimited_and_writes_nothing() {
-        // The OCI spec spells "no limit" as a negative number; writing it
-        // through would put a nonsense value in the cgroup file.
+        // The OCI spec spells "no limit" as a negative number.
         let resources =
             spec::Resources { pids: Some(spec::Pids { limit: -1 }), ..spec::Resources::default() };
         assert_eq!(Limits::from_oci(Some(&resources)).unwrap().pids_max, None);
@@ -685,7 +662,7 @@ mod tests {
     #[test]
     fn the_bundles_swap_field_is_the_combined_ceiling_not_the_swap_one() {
         // linux.resources.memory.swap is memory+swap; memory.swap.max is swap
-        // alone, so the difference is what the kernel wants.
+        // alone.
         let resources = spec::Resources {
             memory: Some(spec::Memory {
                 limit: Some(64 * 1024 * 1024),
@@ -701,8 +678,8 @@ mod tests {
 
     #[test]
     fn a_bundle_memory_limit_without_swap_leaves_swap_alone() {
-        // Unlike the CLI flag: the spec says nothing about swap here, and
-        // inventing a zero would be a limit the caller never asked for.
+        // Unlike the CLI flag: inventing a zero would be a limit the bundle
+        // never asked for.
         let resources = spec::Resources {
             memory: Some(spec::Memory { limit: Some(1024), ..Default::default() }),
             ..spec::Resources::default()

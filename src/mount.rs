@@ -1,8 +1,8 @@
 //! Building and applying the container's mount table.
 //!
 //! `prepare` produces a `MountPlan` without touching the system, so the
-//! ordering — the part that fails quietly when it is wrong — is unit-testable
-//! without root. `apply` runs it inside the new mount namespace and is dumb.
+//! ordering — the part that fails quietly when it is wrong — is testable
+//! without root. `apply` runs it inside the new mount namespace.
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
@@ -99,10 +99,9 @@ const DEVICES: &[&str] = &["null", "zero", "random", "urandom", "tty"];
 
 /// The devices the runtime spec says a runtime MUST provide.
 ///
-/// A bundle does not list these — podman's `linux.devices` is empty and its
-/// mount list stops at putting a tmpfs on `/dev`. Leaving them out is not a
-/// missing convenience: masking a path binds `/dev/null` over it, so without
-/// this the whole `maskedPaths` pass fails on a container that has no `/dev`.
+/// A bundle does not list these: podman's `linux.devices` is empty and its
+/// mount list stops at a tmpfs on `/dev`. Masking a path binds `/dev/null` over
+/// it, so without these the whole `maskedPaths` pass fails.
 const OCI_DEFAULT_DEVICES: &[&str] = &["null", "zero", "full", "random", "urandom", "tty"];
 
 /// `/dev` symlinks every shell expects to find.
@@ -113,8 +112,7 @@ const DEV_SYMLINKS: &[(&str, &str)] = &[
     ("/proc/self/fd/2", "stderr"),
 ];
 
-/// The root-privileged mount setup. Phase 6 adds an idmapped-mount strategy
-/// alongside it.
+/// The bespoke CLI's mount setup.
 pub struct StandardMounts {
     pub readonly_binds: Vec<BindSpec>,
 }
@@ -228,9 +226,8 @@ impl MountStrategy for StandardMounts {
 
 /// The mount table an OCI bundle asks for.
 ///
-/// Unlike [`StandardMounts`], nothing here is quilt's idea of a sensible
-/// container: every filesystem, every option string and every masked path comes
-/// out of `config.json`, because the caller is entitled to decide those.
+/// Unlike [`StandardMounts`], every filesystem, option string and masked path
+/// comes out of `config.json`; none of it is quilt's choice.
 pub struct OciMounts {
     mounts: Vec<OciMount>,
     masked_paths: Vec<PathBuf>,
@@ -352,9 +349,8 @@ impl OciMounts {
             });
         }
 
-        // The OCI type "cgroup" predates the unified hierarchy. With cgroup v2
-        // there is one filesystem and it is called cgroup2; mounting the v1
-        // "cgroup" type here would fail on a v2-only host.
+        // The OCI type "cgroup" predates the unified hierarchy. On a v2-only
+        // host the filesystem is called cgroup2 and the v1 type fails.
         let fstype = if kind == "cgroup" { "cgroup2" } else { kind };
 
         Ok(MountOp::Filesystem {
@@ -367,15 +363,12 @@ impl OciMounts {
         })
     }
 
-    /// `linux.mountLabel` is an SELinux context, and applying it is nothing
-    /// more than passing `context=` through to `mount(2)`. Only the filesystems
-    /// quilt creates take it; a bind inherits the label of what it binds, and
-    /// proc and sysfs have labels of their own.
+    /// `linux.mountLabel` is an SELinux context, applied by passing `context=`
+    /// to `mount(2)`. Only the filesystems quilt creates take it: a bind
+    /// inherits the label of what it binds, and proc and sysfs have their own.
     fn data_for(&self, fstype: &str, mut data: Vec<String>) -> Option<String> {
-        // Not mqueue: it rejects the option outright with EINVAL, which surfaces
-        // as an unexplained mount failure several steps into the plan. SELinux
-        // only accepts a mount-point label on filesystems it can label that
-        // way, and mqueue is not one of them.
+        // Not mqueue: it answers EINVAL, which surfaces as an unexplained
+        // mount failure several steps into the plan.
         const LABELLED: &[&str] = &["tmpfs", "devpts"];
 
         if let Some(label) = &self.mount_label
@@ -413,8 +406,7 @@ fn default_devices(rootfs: &Path) -> Vec<MountOp> {
 /// and the filesystem-specific data that is left over.
 ///
 /// Anything unrecognised is data, not an error: `mode=0755`, `newinstance` and
-/// `ptmxmode=0666` are all filesystem options, and a runtime has no business
-/// keeping a list of every option every filesystem accepts.
+/// `ptmxmode=0666` are filesystem options, and a runtime cannot know them all.
 fn parse_options(options: &[String]) -> (MountFlags, Option<MountPropagationFlags>, Vec<String>) {
     let mut flags = MountFlags::empty();
     let mut propagation: Option<MountPropagationFlags> = None;
@@ -520,9 +512,8 @@ fn apply_op(op: &MountOp) -> Result<()> {
         MountOp::Mask { path } => mask(path),
 
         MountOp::Freeze { path } => {
-            // A path that is not in the image is nothing to protect. runc skips
-            // these too: config.json lists the union of what any image might
-            // have.
+            // config.json lists the union of what any image might have, so a
+            // path this one lacks is nothing to protect. runc skips these too.
             if !path.exists() {
                 return Ok(());
             }
@@ -550,8 +541,8 @@ fn mask(path: &Path) -> Result<()> {
 }
 
 /// `pivot_root(".", ".")` with the old root stacked on the new one, then
-/// detached. Avoids needing a `put_old` directory inside the image, and unlike
-/// `chroot` it actually removes the host tree from the namespace.
+/// detached. Needs no `put_old` directory inside the image, and unlike `chroot`
+/// it removes the host tree from the namespace.
 fn pivot_root(new_root: &Path) -> Result<()> {
     rustix::process::chdir(new_root).context(|| format!("chdir to {}", new_root.display()))?;
     rustix::process::pivot_root(".", ".").context(|| "pivot_root(\".\", \".\")".to_string())?;
@@ -561,8 +552,7 @@ fn pivot_root(new_root: &Path) -> Result<()> {
     rustix::process::chdir("/").context(|| "chdir to the new root".to_string())
 }
 
-/// `struct mount_attr`, `MOUNT_ATTR_SIZE_VER0`. `userns_fd` is what phase 6
-/// fills in for idmapped mounts.
+/// `struct mount_attr`, `MOUNT_ATTR_SIZE_VER0`.
 #[repr(C, align(8))]
 #[derive(Default)]
 struct MountAttr {
@@ -576,14 +566,12 @@ const MOUNT_ATTR_RDONLY: u64 = 0x1;
 
 /// Marks a mount read-only, and with `recursive` its whole subtree.
 ///
-/// A bind mount cannot be created read-only in one call: the kernel takes
-/// MS_RDONLY from the source mount, not from the bind. The classic fix is a
-/// second `mount(MS_REMOUNT | MS_BIND | MS_RDONLY)` pass, but that covers only
-/// the top mount, and inside a user namespace it must also carry forward every
-/// flag the kernel locked on the way in or it fails with a bare EPERM.
-///
-/// `mount_setattr` only sets an attribute and clears nothing, so no locked flag
-/// is at stake, and `AT_RECURSIVE` reaches the submounts in the same call.
+/// A bind cannot be created read-only in one call: the kernel takes MS_RDONLY
+/// from the source mount. The usual second `mount(MS_REMOUNT | MS_BIND |
+/// MS_RDONLY)` pass covers only the top mount, and inside a user namespace it
+/// must carry forward every flag the kernel locked on the way in or fail with a
+/// bare EPERM. `mount_setattr` clears nothing, so no locked flag is at stake,
+/// and `AT_RECURSIVE` reaches the submounts in the same call.
 fn set_readonly(target: &Path, recursive: bool) -> Result<()> {
     let path = CString::new(target.as_os_str().as_bytes())
         .map_err(|_| Error::msg(format!("{} contains a NUL byte", target.display())))?;
@@ -756,8 +744,7 @@ mod tests {
 
     #[test]
     fn devpts_options_are_data_not_unknown_flags() {
-        // newinstance and ptmxmode belong to the filesystem. Treating an
-        // unrecognised word as an error would reject a legal bundle.
+        // newinstance and ptmxmode belong to the filesystem.
         let options: Vec<String> = ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "gid=5"]
             .iter()
             .map(|s| s.to_string())
@@ -831,8 +818,7 @@ mod tests {
 
     #[test]
     fn masking_a_path_has_a_dev_null_to_bind_over_it() {
-        // The two are connected: `mask` binds /dev/null over a file, so a
-        // container with masked paths and no /dev/null cannot be created.
+        // `mask` binds /dev/null over a file, so masked paths need a /dev.
         let plan = oci_plan();
         let null = position(&plan, "/srv/rootfs/dev/null");
         let masked = plan.ops.iter().position(|op| matches!(op, MountOp::Mask { .. })).unwrap();
@@ -854,8 +840,7 @@ mod tests {
 
     #[test]
     fn a_bundle_that_does_not_mount_dev_is_left_alone() {
-        // Without a tmpfs on /dev the image's own /dev is what the container
-        // gets, and binding over it would be quilt inventing policy.
+        // Without a tmpfs on /dev the container gets the image's own.
         let json = r#"{
             "ociVersion": "1.2.1",
             "process": {"args": ["true"]},
@@ -948,7 +933,7 @@ mod tests {
         assert!(data.contains("mode=755"));
         assert!(data.contains(r#"context="system_u:object_r:container_file_t:s0:c1,c2""#));
 
-        // proc carries its own label; handing it a context= would be wrong.
+        // proc carries its own label.
         let proc = plan.ops.iter().find(|op| op.target() == Path::new("/srv/rootfs/proc")).unwrap();
         let MountOp::Filesystem { data, .. } = proc else { panic!("expected a filesystem") };
         assert_eq!(*data, None);

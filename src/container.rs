@@ -1,8 +1,7 @@
 //! Orchestration for one container: clone, map ids, hand off to init, wait.
 //!
-//! `create` and `start` are separate verbs in the OCI spec, so phase 4 splits
-//! this and adds an exec fifo plus state on disk. Phase 1 only needs `run`,
-//! which is the two of them back to back.
+//! `run` is the bespoke CLI's single verb. The OCI lifecycle below it splits
+//! the same work across three processes that share state on disk.
 
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -50,12 +49,10 @@ pub fn run(
     driver: &dyn CgroupDriver,
     namespaces: Namespaces,
 ) -> Result<i32> {
-    // The scope exists before the workload does, and `Scope`'s `Drop` removes
-    // it on every path out of this function, including the error ones.
-    //
-    // The clone below copies this guard into the child, but every path the
-    // child takes ends in `execve` or `exit_group`, neither of which unwinds,
-    // so the child never runs the destructor and never deletes the scope.
+    // `Scope`'s `Drop` removes this on every path out, error paths included.
+    // The clone copies the guard into the child, but every path the child takes
+    // ends in `execve` or `exit_group`, neither of which unwinds, so the child
+    // never runs the destructor.
     let scope = Scope::create(driver, &spec.limits)?;
     let scope_fd = scope.open()?;
 
@@ -82,10 +79,10 @@ pub fn run(
                 rustix::runtime::exit_group(EXIT_INIT_FAILED);
             }
             // Only stdio should reach the container. The pipe above is CLOEXEC,
-            // but descriptors quilt inherited from its own caller are not.
-            // SAFETY: nothing below this point uses a descriptor above 2, and
-            // every path from here ends in `execve` or `exit_group`, so no
-            // `OwnedFd` destructor runs to close one of these twice.
+            // but descriptors quilt inherited from its caller are not.
+            // SAFETY: nothing below uses a descriptor above 2, and every path
+            // from here ends in `execve` or `exit_group`, so no `OwnedFd`
+            // destructor runs to close one of these twice.
             if unsafe { crate::syscall::close_range(3, u32::MAX, 0) }.is_err() {
                 rustix::runtime::exit_group(EXIT_INIT_FAILED);
             }
@@ -105,10 +102,9 @@ pub fn run(
                 return Err(e);
             }
 
-            // The host side needs the child's pid to name its netns, so it can
-            // only happen now, and it must finish before the child is released:
-            // init configures the container end and the veth has to be there.
-            // `HostLink` deletes the pair on the way out of this scope.
+            // The host side needs the child's pid to name its netns, and must
+            // finish before the child is released, since init configures the
+            // container end. `HostLink` deletes the pair on the way out.
             let _link = match &spec.network {
                 Some(Connectivity::Bridge(plan)) => match veth::connect(plan, child) {
                     Ok(link) => Some(link),
@@ -141,8 +137,8 @@ pub fn run(
     }
 }
 
-/// The argv the re-exec'd `/proc/self/exe init` is given. Phase 4 replaces this
-/// channel with the bundle's `config.json`.
+/// The argv the re-exec'd `/proc/self/exe init` is given. The OCI path uses the
+/// bundle's `config.json` instead.
 fn init_argv(spec: &RunSpec) -> Vec<String> {
     let mut argv = vec![
         "quilt".to_string(),
@@ -233,10 +229,9 @@ fn wait_for_exit(child: Pid) -> Result<i32> {
 }
 
 /// Says so when the kernel OOM-killed something in the scope, which otherwise
-/// reaches the caller only as an unexplained 137.
-///
-/// Read before the scope is removed, and only when a memory limit was set —
-/// without the memory controller there is no `memory.events` to read.
+/// reaches the caller as an unexplained 137. Read before the scope is removed,
+/// and only when a memory limit was set: without the memory controller there is
+/// no `memory.events`.
 fn report_oom_kills(scope: &Scope, limits: &Limits) {
     if limits.memory_max.is_none() {
         return;
@@ -249,9 +244,8 @@ fn report_oom_kills(scope: &Scope, limits: &Limits) {
 }
 
 /// A container's exit code, or `None` if it has not reached a terminal state.
-///
-/// A process killed by a signal has no exit status of its own, so quilt reports
-/// the shell's `128 + signal`, which is what a caller of `run` expects.
+/// A process killed by a signal has no exit status of its own, so this reports
+/// the shell's `128 + signal`.
 fn exit_code(exit_status: Option<i32>, terminating_signal: Option<i32>) -> Option<i32> {
     exit_status.or_else(|| terminating_signal.map(|signal| 128 + signal))
 }
@@ -425,10 +419,8 @@ mod tests {
 /// Where the runtime keeps per-container state.
 ///
 /// `/run` belongs to root, so an unprivileged runtime uses the per-user runtime
-/// directory instead. Deliberately not `XDG_RUNTIME_DIR`: `create`, `start` and
-/// `delete` are three separate processes and the caller does not have to give
-/// them the same environment, so a state root read out of one would be a state
-/// root they could disagree about.
+/// directory. Not `XDG_RUNTIME_DIR`: the three verbs are three processes and
+/// need not share an environment, so they could disagree about it.
 pub fn default_state_root() -> PathBuf {
     if crate::idmap::has_host_privilege() {
         PathBuf::from("/run/quilt")
@@ -446,11 +438,8 @@ pub enum Status {
     Stopped,
 }
 
-/// What quilt records between verbs.
-///
-/// A superset of the state the OCI spec defines, because a runtime needs
-/// bookkeeping the caller has no business seeing. [`print_state`] prints only
-/// the standard fields.
+/// What quilt records between verbs: a superset of the OCI state, since some
+/// of it is bookkeeping. [`print_state`] prints only the standard fields.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SavedState {
@@ -458,11 +447,9 @@ struct SavedState {
     id: String,
     status: Status,
     pid: i32,
-    /// The init process's start time, from `/proc/<pid>/stat`.
-    ///
-    /// A pid on its own is not an identity: pids are reused, and a verb that
-    /// arrives after the container died could otherwise signal an unrelated
-    /// process that inherited the number.
+    /// The init process's start time, from `/proc/<pid>/stat`. A pid alone is
+    /// not an identity: a verb arriving after the container died would
+    /// otherwise signal whatever inherited the number.
     pid_start_time: u64,
     bundle: PathBuf,
     cgroup_scope: PathBuf,
@@ -540,10 +527,9 @@ fn save(root: &Path, state: &SavedState) -> Result<()> {
 
 /// Field 22 of `/proc/<pid>/stat`, the process's start time in clock ticks.
 ///
-/// The command name is field 2 and is wrapped in parentheses but is otherwise
-/// unescaped, so it can contain spaces and its own parentheses. Splitting on
-/// whitespace from the left is the classic way to get this wrong; everything
-/// after the last `)` is the only safe place to start counting.
+/// Field 2 is the command name in parentheses, otherwise unescaped, so it can
+/// contain spaces and its own parentheses. Everything after the last `)` is the
+/// only safe place to start counting.
 fn parse_start_time(stat: &str) -> Option<u64> {
     let after_comm = &stat[stat.rfind(')')? + 1..];
     // Fields resume at 3, so the start time is the 20th from here.
@@ -585,14 +571,10 @@ pub fn create(
     let config = crate::spec::Config::parse(&json)?;
     config.validate()?;
 
-    // Anything that can be decided from the bundle alone is decided now.
-    //
-    // The rest of the setup happens in the init process, and init reports it
-    // survived *before* it parks on the exec fifo — so a policy quilt cannot
-    // carry out would otherwise not be discovered until `start`, long after
-    // `create` told the caller the container exists. A seccomp profile using an
-    // action quilt cannot assemble is the case that shows it: the container
-    // would be created, started, and only then refuse to run.
+    // Anything decidable from the bundle alone is decided now. The rest happens
+    // in init, which reports success *before* parking on the fifo, so a policy
+    // quilt cannot carry out would otherwise surface at `start` — after `create`
+    // told the caller the container exists.
     if let Some(profile) = &config.linux.seccomp {
         crate::seccomp::compile(profile)?;
     }
@@ -656,8 +638,7 @@ pub fn create(
     match unsafe { ns::clone3(&args) }? {
         Fork::Child => {
             drop(ready_read);
-            // Everything except stdio and the readiness pipe. Sweeping around
-            // it rather than duplicating it keeps this to two syscalls.
+            // Everything except stdio and the readiness pipe.
             if sweep_except(ready_number).is_err() {
                 rustix::runtime::exit_group(EXIT_INIT_FAILED);
             }
@@ -670,8 +651,7 @@ pub fn create(
             drop(ready_write);
 
             if !wait_for_maps(&ready_read) {
-                // init already said what went wrong on stderr, which the caller
-                // is capturing; repeating a guess here would only obscure it.
+                // init already said what went wrong on stderr.
                 kill_and_reap(child);
                 return Err(Error::msg(format!("container {id} failed to start")));
             }
@@ -725,8 +705,7 @@ pub fn start(root: &Path, id: &str) -> Result<()> {
     }
 
     let fifo = state_dir(root, id)?.join("exec.fifo");
-    // Opening for writing is what unblocks init's read. Nothing about the byte
-    // matters, only that the open pairs up.
+    // The open is what unblocks init's read; the byte itself does not matter.
     let writer = rustix::fs::open(
         &fifo,
         rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::CLOEXEC,
@@ -784,8 +763,8 @@ pub fn delete(root: &Path, id: &str, force: bool) -> Result<()> {
         }
     }
 
-    // Dropping the scope kills whatever is left in it and waits for the cgroup
-    // to empty, so this covers the container's other processes too.
+    // Dropping the scope kills whatever is left in it, so this covers the
+    // container's other processes too.
     drop(Scope::adopt(state.cgroup_scope.clone()));
 
     let dir = state_dir(root, id)?;
@@ -800,8 +779,7 @@ fn parse_signal(name: &str) -> Result<Signal> {
             .ok_or_else(|| Error::msg(format!("{number} is not a signal")));
     }
 
-    // Upper-case before stripping, or a lower-case "sigterm" keeps its prefix
-    // and matches nothing.
+    // Upper-case before stripping, or "sigterm" keeps its prefix.
     let upper = name.to_ascii_uppercase();
     let number = match upper.strip_prefix("SIG").unwrap_or(&upper) {
         "HUP" => 1,

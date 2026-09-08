@@ -22,10 +22,9 @@ if [ -z "$binary" ]; then
     exit 1
 fi
 
-# A killed or panicking run leaves root-owned state behind: cgroup scopes, veth
-# ends, and bundles under /tmp that the invoking user cannot then remove. None
-# of it is load-bearing, and leaving it lying around makes the next run fail for
-# reasons that have nothing to do with the code.
+# A killed or panicking run leaves root-owned cgroup scopes, veth ends and
+# bundles under /tmp that the invoking user cannot remove, and that make the
+# next run fail for reasons unrelated to the code.
 purge() {
     sudo sh -c '
         for scope in /sys/fs/cgroup/quilt/*/; do

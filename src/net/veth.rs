@@ -98,10 +98,9 @@ pub fn host_link_name(seed: u32) -> String {
 /// Picks a host address inside the subnet.
 ///
 /// `.1` is the gateway and `.0`/`.255.255` are the network and broadcast, so
-/// the host part is folded into the range that is left. Two containers running
-/// at once get different seeds, so they get different addresses; this is not
-/// real IPAM, and does not try to be — allocation is podman's job in the OCI
-/// path, and this exists to give the bespoke CLI something to route.
+/// the host part is folded into what is left. Not IPAM: containers running at
+/// once get different seeds and so different addresses, which is all `run`
+/// needs. Allocation is podman's job on the OCI path.
 pub fn address_for(seed: u32) -> Ipv4Addr {
     let host_part = 2 + (seed % 65_532);
     let [a, b, _, _] = SUBNET.octets();
@@ -110,8 +109,7 @@ pub fn address_for(seed: u32) -> Ipv4Addr {
 
 /// Reads an interface's index out of sysfs.
 ///
-/// The alternative is an `RTM_GETLINK` round trip and a second parser for the
-/// reply; the index is right here, and the encoder is what this phase is about.
+/// The alternative is an `RTM_GETLINK` round trip and a parser for the reply.
 fn link_index(netns_sysfs: &Path, name: &str) -> Result<u32> {
     let path = netns_sysfs.join(name).join("ifindex");
     let raw = std::fs::read_to_string(&path).context(|| format!("reading {}", path.display()))?;
@@ -229,10 +227,8 @@ pub fn connect(plan: &Plan, pid: Pid) -> Result<HostLink> {
 
 /// Lets the container's traffic leave the host.
 ///
-/// The nftables rule goes in through `nft` rather than hand-assembled
-/// nf_tables netlink. That is a second encoder as large as this whole phase and
-/// it teaches the same lesson twice; the phase 3 bar is the rtnetlink encoder's
-/// bytes. Same bargain phase 6 makes with `newuidmap`.
+/// The rule goes in through `nft` rather than hand-assembled nf_tables
+/// netlink, which would be a second encoder as large as the rtnetlink one.
 fn enable_egress() -> Result<()> {
     enable_forwarding()?;
 
@@ -257,10 +253,9 @@ fn enable_egress() -> Result<()> {
 
 /// Turns on IPv4 forwarding, which is host-wide and outlives the container.
 ///
-/// quilt is a one-shot process changing a setting that belongs to the whole
-/// machine, so it says when it is the one doing it rather than flipping it
-/// silently. It is not restored afterwards: another container, or anything else
-/// on the host, may be relying on it by then.
+/// A one-shot process changing a machine-wide setting, so it says so rather
+/// than flipping it silently. Not restored afterwards: something else on the
+/// host may be relying on it by then.
 fn enable_forwarding() -> Result<()> {
     const PATH: &str = "/proc/sys/net/ipv4/ip_forward";
 
@@ -293,22 +288,20 @@ fn masquerade_ruleset() -> String {
 
 /// One `RTM_NEWLINK` that creates both ends and places the far one.
 ///
-/// This is the deepest nest the encoder has to build: `IFLA_LINKINFO` holds
-/// `IFLA_INFO_KIND` and `IFLA_INFO_DATA`, and for a veth `IFLA_INFO_DATA` holds
-/// `VETH_INFO_PEER`, which is a whole second `ifinfomsg` with its own
-/// attributes. `IFLA_NET_NS_PID` in there is what moves the peer into the
-/// container's netns, so it is never visible on the host and cannot collide
-/// with a host interface already called eth0.
+/// The deepest nest the encoder builds: `IFLA_LINKINFO` holds `IFLA_INFO_KIND`
+/// and `IFLA_INFO_DATA`, and for a veth the latter holds `VETH_INFO_PEER`, a
+/// whole second `ifinfomsg` with its own attributes. `IFLA_NET_NS_PID` in there
+/// moves the peer straight into the container's netns, so it is never visible
+/// on the host and cannot collide with an existing eth0.
 fn create_veth(socket: &mut Socket, host_name: &str, pid: Pid) -> Result<()> {
     let message = create_veth_message(host_name, Some(pid.as_raw_nonzero().get() as u32));
     socket.request(message, "creating the veth pair")
 }
 
-/// `peer_pid` of `None` leaves both ends on the host. Nothing in the runtime
-/// wants that, but it is the shape `ip link add ... type veth peer name ...`
-/// produces, which is what the golden capture can be compared against:
-/// `ip`'s `netns` argument resolves to an open descriptor and goes out as
-/// `IFLA_NET_NS_FD`, and quilt has a pid rather than a descriptor.
+/// `peer_pid` of `None` leaves both ends on the host. The runtime never wants
+/// that, but it is the shape `ip link add ... type veth peer name ...` sends,
+/// which is what the golden capture compares against: `ip`'s `netns` argument
+/// resolves to a descriptor and goes out as `IFLA_NET_NS_FD`.
 fn create_veth_message(host_name: &str, peer_pid: Option<u32>) -> Message {
     let mut message = Message::new(
         netlink::RTM_NEWLINK,
@@ -322,9 +315,9 @@ fn create_veth_message(host_name: &str, peer_pid: Option<u32>) -> Message {
     let info_data = message.nest(netlink::IFLA_INFO_DATA);
     let peer = message.nest(netlink::VETH_INFO_PEER);
     message.payload(&netlink::ifinfomsg(netlink::AF_UNSPEC, 0, 0, 0));
-    // The namespace attribute goes before the name, which is the order `ip`
-    // uses. The kernel parses attributes into a table and does not care, but
-    // matching it keeps the capture comparison about substance.
+    // Before the name, which is the order `ip` uses. The kernel parses
+    // attributes into a table and does not care, but matching keeps the capture
+    // comparison about substance.
     if let Some(pid) = peer_pid {
         message.attr_u32(netlink::IFLA_NET_NS_PID, pid);
     }
@@ -360,7 +353,7 @@ pub fn configure(endpoint: &Endpoint) -> Result<()> {
     let index = index_of(CONTAINER_LINK)?;
     add_address(&mut socket, index, endpoint.address, endpoint.prefix_len, false)?;
     // The route below needs the connected prefix, which only appears once the
-    // link is up, so the ordering here is load-bearing.
+    // link is up.
     set_up(&mut socket, CONTAINER_LINK)?;
     add_default_route(&mut socket, index, endpoint.gateway)
 }
@@ -423,9 +416,8 @@ mod tests {
     /// Reads a message captured from `ip` with `scripts/capture-netlink.sh`.
     ///
     /// The captures are committed artifacts, so a missing one is a broken
-    /// checkout, not a reason to skip. Nothing else in the suite compares these
-    /// bytes; if this returns without looking, the phase 3 acceptance criterion
-    /// is unverified and says otherwise.
+    /// checkout, not a reason to skip: nothing else in the suite compares these
+    /// bytes.
     fn golden(name: &str) -> Vec<u8> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden").join(name);
         let hex = std::fs::read_to_string(&path).unwrap_or_else(|e| {
@@ -446,8 +438,8 @@ mod tests {
         assert_eq!(message.finish(0), golden(name), "{name} diverges from what ip sends");
     }
 
-    /// The veth request is the deepest nest in the project and the place an
-    /// encoder bug would actually live, so it is held to byte equality.
+    /// The deepest nest in the project, and where an encoder bug would live,
+    /// so it is held to byte equality.
     #[test]
     fn the_veth_message_is_byte_identical_to_what_ip_sends() {
         // Must match the invocation in scripts/capture-netlink.sh, which
@@ -476,9 +468,8 @@ mod tests {
         assert!(!without.windows(8).any(|w| w == expected));
     }
 
-    /// Everything else is compared for what the kernel reads rather than
-    /// byte-for-byte, so iproute2's stylistic choices do not end up pinned in
-    /// this suite.
+    /// Everything else is compared for what the kernel reads, so iproute2's
+    /// stylistic choices do not end up pinned here.
     #[test]
     fn the_bridge_message_asks_for_the_same_thing_ip_asks_for() {
         let theirs =
@@ -499,9 +490,8 @@ mod tests {
         let ours = netlink::parse(&set_up_message("qvgolden").finish(0), 16, &[]).unwrap();
 
         // iproute2 modifies an existing link with RTM_NEWLINK minus
-        // NLM_F_CREATE; quilt uses RTM_SETLINK, which is the message named for
-        // the job. The kernel registers a handler for both and they end up in
-        // the same place, so the capture accepts either and this records which.
+        // NLM_F_CREATE; quilt uses RTM_SETLINK. The kernel handles both the
+        // same way, so the capture accepts either and this records which.
         assert!(
             matches!(theirs.kind, netlink::RTM_NEWLINK | netlink::RTM_SETLINK),
             "ip sent an unexpected message type {}",
@@ -510,14 +500,12 @@ mod tests {
         assert_eq!(ours.kind, netlink::RTM_SETLINK);
 
         // ifi_flags and ifi_change, the last two words of ifinfomsg: which bits
-        // are being set, and which of them this message is authoritative for.
-        // This is the part that actually has to agree.
+        // are set, and which this message is authoritative for.
         assert_eq!(ours.payload[8..16], theirs.payload[8..16]);
 
         // The accepted divergence, asserted rather than glossed over: iproute2
-        // resolves the name to an index before sending and identifies the link
-        // by ifi_index, while quilt sends ifi_index 0 and IFLA_IFNAME. The
-        // kernel takes either.
+        // resolves the name to an index first, quilt sends ifi_index 0 and
+        // IFLA_IFNAME. The kernel takes either.
         assert_ne!(theirs.payload[4..8], [0, 0, 0, 0], "ip identifies by index");
         assert_eq!(ours.payload[4..8], [0, 0, 0, 0]);
         assert!(

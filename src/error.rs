@@ -4,10 +4,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// An error with the operation that produced it attached.
 ///
-/// Runtime failures surface to the caller as text on stderr and an exit code,
-/// so the context string is the whole diagnostic. The errno is kept apart from
-/// it because phase 4 has to map specific failures onto the exit codes the OCI
-/// caller expects.
+/// Failures reach the caller as text on stderr and an exit code, so the context
+/// string is the whole diagnostic. The errno is kept apart from it so callers
+/// can map specific failures onto their own exit codes.
 #[derive(Debug)]
 pub struct Error {
     context: String,

@@ -102,11 +102,10 @@ impl Message {
 
     /// A string attribute, without a terminator.
     ///
-    /// Whether a string is NUL-terminated is decided per attribute, not once
-    /// for netlink: the kernel's `nla_strcmp` strips a trailing NUL before
-    /// comparing, so both forms work, but they are different bytes. Captures of
-    /// `ip` show `IFLA_INFO_KIND` sent bare and `IFLA_IFNAME` sent terminated,
-    /// so quilt matches that. See [`Message::attr_nul_str`].
+    /// Termination is decided per attribute, not once for netlink: the
+    /// kernel's `nla_strcmp` strips a trailing NUL, so both forms work but are
+    /// different bytes. Captures of `ip` show `IFLA_INFO_KIND` bare and
+    /// `IFLA_IFNAME` terminated. See [`Message::attr_nul_str`].
     pub fn attr_str(&mut self, kind: u16, value: &str) -> &mut Self {
         self.attr(kind, value.as_bytes())
     }
@@ -202,7 +201,7 @@ enum Ack {
 /// Walks a buffer of netlink messages looking for the acknowledgement of `seq`.
 ///
 /// An `NLMSG_ERROR` with a zero error code is the success acknowledgement, not
-/// a failure — the name is a misnomer that is easy to get backwards.
+/// a failure.
 fn find_ack(buf: &[u8], seq: u32) -> Ack {
     let mut offset = 0;
     while offset + NLMSGHDR_LEN <= buf.len() {
@@ -234,8 +233,8 @@ pub enum Attr {
 
 /// A decoded request.
 ///
-/// Used to compare two encodings of the same intent where they are allowed to
-/// differ in style — attribute order, or a NUL that the kernel strips anyway.
+/// Compares two encodings of the same intent where they may differ in style:
+/// attribute order, or a NUL the kernel strips anyway.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Parsed {

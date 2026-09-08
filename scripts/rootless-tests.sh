@@ -1,7 +1,6 @@
 #!/bin/sh
-# Phase 6: the same runtime as an ordinary user. No sudo anywhere, which is the
-# whole point — running these as root would exercise the privileged half of
-# every seam instead.
+# The same runtime as an ordinary user. No sudo anywhere: as root these would
+# exercise the privileged half of every seam instead.
 set -eu
 
 cd "$(dirname "$0")/.."

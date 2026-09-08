@@ -1,9 +1,8 @@
 //! A classic-BPF assembler, and the seccomp filters built with it.
 //!
-//! No `libseccomp`. The filter is assembled instruction by instruction, which
-//! is the single most on-theme piece of work in the project: a seccomp program
-//! is a tiny virtual machine's worth of code, and the interesting failures are
-//! all in how it is laid out rather than in any one syscall.
+//! No `libseccomp`: the filter is assembled instruction by instruction. The
+//! interesting failures are in how a program is laid out rather than in any one
+//! syscall.
 
 use crate::error::{Error, Result};
 
@@ -70,9 +69,8 @@ enum Emit {
 /// Builds a program, resolving forward jumps at the end.
 ///
 /// Classic BPF jumps are relative offsets counted from the *following*
-/// instruction and held in a single byte, so they only go forward and only 255
-/// instructions at a time. Both limits are real, and both are checked here
-/// rather than discovered when the kernel rejects the program.
+/// instruction and held in a single byte, so they go forward only and at most
+/// 255 at a time. Both limits are checked here rather than at load time.
 #[derive(Default)]
 pub struct Assembler {
     code: Vec<Emit>,
@@ -181,10 +179,9 @@ impl Assembler {
 
 /// The x86-64 syscall table, from `asm/unistd_64.h`.
 ///
-/// Names the kernel does not have on this architecture are not an error: a
-/// profile written for several architectures lists all their names, and 79 of
-/// the 432 podman sends are 32-bit or x32 spellings like `chown32`. Those are
-/// refused by the architecture check regardless.
+/// Names this architecture does not have are not an error: a profile written
+/// for several lists all of theirs, and 79 of the 432 podman sends are 32-bit
+/// or x32 spellings like `chown32`. The architecture check refuses those.
 const SYSCALLS: &[(&str, u32)] = &[
     ("read", 0),
     ("write", 1),
@@ -577,10 +574,9 @@ pub fn syscall_number(name: &str) -> Option<u32> {
     SYSCALLS.iter().find(|(known, _)| *known == name).map(|(_, number)| *number)
 }
 
-/// Runs a program the way the kernel would, for testing.
-///
-/// A filter that is subtly wrong still loads, so the only way to know what one
-/// decides is to ask it. This is the interpreter that asks.
+/// Runs a program the way the kernel would, for testing. A filter that is
+/// subtly wrong still loads, so the only way to know what one decides is to run
+/// it.
 #[cfg(test)]
 pub fn simulate(program: &[Instruction], arch: u32, nr: u32, args: [u64; 6]) -> u32 {
     let word = |offset: u32| -> u32 {
@@ -635,14 +631,12 @@ fn action_for(name: &str, errno: Option<u32>) -> Result<u32> {
         "SCMP_ACT_ALLOW" => SECCOMP_RET_ALLOW,
         "SCMP_ACT_LOG" => SECCOMP_RET_LOG,
         "SCMP_ACT_TRAP" => SECCOMP_RET_TRAP,
-        // Both spellings mean the thread, not the process. The distinction
-        // matters: killing one thread of a multi-threaded workload leaves the
-        // rest running.
+        // Both spellings mean the thread: killing one thread of a
+        // multi-threaded workload leaves the rest running.
         "SCMP_ACT_KILL" | "SCMP_ACT_KILL_THREAD" => SECCOMP_RET_KILL_THREAD,
         "SCMP_ACT_KILL_PROCESS" => SECCOMP_RET_KILL_PROCESS,
-        // EPERM by default. The spec's own advice is to prefer an errno over a
-        // kill, because a denied syscall surfaces deep inside a program nobody
-        // here wrote and a corpse says nothing about which one it was.
+        // EPERM by default. An errno beats a kill: a corpse says nothing about
+        // which syscall was denied.
         "SCMP_ACT_ERRNO" => SECCOMP_RET_ERRNO | (errno.unwrap_or(1) & SECCOMP_RET_DATA),
         "SCMP_ACT_TRACE" => SECCOMP_RET_TRACE | (errno.unwrap_or(0) & SECCOMP_RET_DATA),
         "SCMP_ACT_NOTIFY" => {
@@ -668,9 +662,8 @@ fn compare_for(op: &str) -> Result<Compare> {
         "SCMP_CMP_EQ" => Compare::Equal,
         "SCMP_CMP_NE" => Compare::NotEqual,
         // The ordering and masked comparisons need more than the two-word
-        // equality test below, and no profile quilt has been given uses them.
-        // Refusing names the one that is missing rather than quietly matching
-        // nothing, which would turn a deny rule into a no-op.
+        // equality test below. Refusing names the one that is missing; matching
+        // nothing would turn a deny rule into a no-op.
         other => {
             return Err(Error::msg(format!(
                 "config.json uses the argument comparison {other}, which quilt does not build"
@@ -681,11 +674,10 @@ fn compare_for(op: &str) -> Result<Compare> {
 
 /// Assembles a filter for the bundle's profile.
 ///
-/// The architecture check comes first and is not negotiable. `seccomp_data.nr`
-/// means nothing without knowing which table it indexes, so a filter that reads
-/// the number first is one a caller from another architecture walks straight
-/// through — its numbers land on whatever this architecture happens to call
-/// them.
+/// The architecture check comes first. `seccomp_data.nr` means nothing without
+/// knowing which table it indexes, so a filter that reads the number first lets
+/// a caller from another architecture through on numbers that mean something
+/// else here.
 pub fn compile(profile: &crate::spec::Seccomp) -> Result<Vec<Instruction>> {
     if !profile.architectures.is_empty()
         && !profile.architectures.iter().any(|a| a == "SCMP_ARCH_X86_64")
@@ -697,10 +689,9 @@ pub fn compile(profile: &crate::spec::Seccomp) -> Result<Vec<Instruction>> {
         )));
     }
     if !profile.flags.is_empty() {
-        // SECCOMP_FILTER_FLAG_* changes how the filter is loaded. quilt sets
-        // one of them itself, behind --seccomp-log; honouring a bundle's list
-        // would mean deciding what each does, and dropping it silently would
-        // mean loading a filter that behaves differently from the one asked for.
+        // SECCOMP_FILTER_FLAG_* changes how the filter is loaded, and dropping
+        // one silently would load a filter unlike the one asked for. quilt sets
+        // the log flag itself, behind --seccomp-log.
         return Err(Error::msg(format!(
             "config.json sets the seccomp flags {:?}, which quilt does not pass on",
             profile.flags
@@ -723,10 +714,9 @@ pub fn compile(profile: &crate::spec::Seccomp) -> Result<Vec<Instruction>> {
 
     let mut assembler = Assembler::new();
 
-    // Each check carries its own kill rather than jumping to a shared one at
-    // the end. A single exit would be several hundred instructions away by the
-    // time the rules are laid out, and a classic-BPF jump offset is one byte —
-    // so the tidier arrangement is the one that will not assemble.
+    // Each check carries its own kill rather than jumping to a shared exit at
+    // the end, which would be several hundred instructions away once the rules
+    // are laid out — further than a one-byte jump offset reaches.
     let supported = assembler.label();
     assembler.load_arch();
     assembler.if_eq(AUDIT_ARCH_X86_64, Target::Label(supported), Target::Next);
@@ -750,9 +740,8 @@ pub fn compile(profile: &crate::spec::Seccomp) -> Result<Vec<Instruction>> {
             .collect::<Result<Vec<_>>>()?;
 
         for name in &rule.names {
-            // A name this architecture does not have cannot be called here, and
-            // a caller from the architecture that does have it is killed above,
-            // so there is nothing to emit and nothing lost by not emitting it.
+            // Uncallable here, and a caller from the architecture that does
+            // have it is killed above.
             let Some(number) = syscall_number(name) else { continue };
             emit_rule(&mut assembler, number, &comparisons, action);
         }
@@ -784,8 +773,8 @@ fn emit_rule(
                 assembler.if_eq(low, Target::Next, Target::Label(done));
             }
             Compare::NotEqual => {
-                // Unequal in either half is enough, so a difference up top skips
-                // the second test rather than failing the rule.
+                // Unequal in either half is enough, so a difference up top
+                // skips the second test.
                 let differs = assembler.label();
                 assembler.load_arg_half(*index, true);
                 assembler.if_eq(high, Target::Next, Target::Label(differs));
@@ -799,8 +788,8 @@ fn emit_rule(
     assembler.ret(action);
     assembler.place(done);
 
-    // Reading an argument leaves it in the accumulator, and every rule after
-    // this one expects to find the syscall number there.
+    // Reading an argument leaves it in the accumulator, where every later rule
+    // expects the syscall number.
     if !comparisons.is_empty() {
         assembler.load_nr();
     }
@@ -814,10 +803,8 @@ struct Program {
 }
 
 const SECCOMP_SET_MODE_FILTER: u64 = 1;
-/// Logs every non-allow decision to the audit log. The spec's own note about
-/// this phase is that seccomp debugging is miserable — a denied syscall shows
-/// up as an unexplained failure deep inside a program nobody here wrote — and
-/// this is what turns it into a line saying which syscall it was.
+/// Logs every non-allow decision to the audit log, turning an unexplained
+/// failure deep inside the workload into a line naming the syscall.
 const SECCOMP_FILTER_FLAG_LOG: u64 = 2;
 
 /// The kernel's ceiling on filter length.
@@ -825,9 +812,9 @@ const MAX_INSTRUCTIONS: usize = 4096;
 
 /// Loads the filter into the current process, for good.
 ///
-/// A filter cannot be removed, and it is inherited across `execve`, which is
-/// what makes it worth installing immediately before one: everything quilt does
-/// to set the container up needs syscalls the container itself must not have.
+/// A filter cannot be removed and is inherited across `execve`, hence
+/// installing it immediately before one: quilt's own setup needs syscalls the
+/// container must not have.
 pub fn install(program: &[Instruction], log: bool) -> Result<()> {
     if program.is_empty() {
         return Err(Error::msg("a seccomp filter cannot be empty".to_string()));
@@ -839,9 +826,9 @@ pub fn install(program: &[Instruction], log: bool) -> Result<()> {
         )));
     }
 
-    // Without no_new_privs the kernel wants CAP_SYS_ADMIN, and by this point the
-    // bundle's capability set has usually taken that away. It is also the right
-    // thing on its own: a filter that a setuid binary can escape is not one.
+    // Without no_new_privs the kernel wants CAP_SYS_ADMIN, which the bundle's
+    // capability set has usually taken away by now. It is also right on its
+    // own: a setuid binary must not be able to escape the filter.
     rustix::thread::set_no_new_privs(true)
         .map_err(|e| Error::from_errno("setting no_new_privs before the seccomp filter", e))?;
 
@@ -1039,9 +1026,8 @@ mod tests {
 
     #[test]
     fn an_argument_equality_test_compares_both_halves_of_the_value() {
-        // A filter that only compared the low word would let 0x1_0000_0000
-        // through as if it were zero. That is exactly the subtly-wrong filter
-        // that still loads.
+        // Comparing only the low word would let 0x1_0000_0000 through as
+        // zero — the subtly-wrong filter that still loads.
         let program = compile(&profile(
             r#"{
                 "defaultAction": "SCMP_ACT_ERRNO",
@@ -1127,10 +1113,8 @@ mod tests {
 
     #[test]
     fn a_rule_that_reads_an_argument_leaves_the_number_where_the_next_rule_expects_it() {
-        // The accumulator holds the syscall number for every comparison. A rule
-        // with arguments overwrites it, and forgetting to put it back makes
-        // every later rule test an argument value against a syscall number —
-        // which loads, and is wrong.
+        // A rule with arguments overwrites the accumulator. Not restoring it
+        // makes every later rule test an argument against a syscall number.
         let program = compile(&profile(
             r#"{
                 "defaultAction": "SCMP_ACT_ERRNO",
@@ -1198,10 +1182,9 @@ mod tests {
 
     #[test]
     fn every_plain_rule_in_podmans_profile_decides_the_way_it_says() {
-        // The point of the interpreter: a filter that is subtly wrong still
-        // loads, so the only way to know what it decides is to run it. Names
-        // that appear more than once, or alongside argument tests, are left out
-        // because the first matching rule wins and the answer depends on order.
+        // Names appearing more than once, or alongside argument tests, are
+        // left out: the first matching rule wins, so the answer is order
+        // dependent.
         let profile = podman_profile();
         let program = compile(&profile).unwrap();
 

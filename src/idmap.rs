@@ -1,9 +1,7 @@
 //! Writing `/proc/<pid>/uid_map` and `gid_map`.
 //!
-//! One of the three seams the spec keeps behind a trait. `Identity` needs
-//! privilege and covers phases 1-5; `SubUid` (phase 6) will shell out to
-//! `newuidmap`, which is setuid and is the only sanctioned way an unprivileged
-//! process gets a range.
+//! `Identity` needs privilege; `SubUid` shells out to `newuidmap`, which is
+//! setuid and is the only sanctioned way an unprivileged process gets a range.
 
 use crate::error::{Context, Error, Result};
 use rustix::process::Pid;
@@ -11,33 +9,26 @@ use rustix::process::Pid;
 /// Whether this process holds privilege over the host, rather than over a user
 /// namespace that only looks like the host from inside.
 ///
-/// Neither half answers this alone. `geteuid()` says 0 inside a namespace too —
-/// rootless podman runs its runtime as uid 0 in one mapped to an unprivileged
-/// user outside, so the runtime believes it is root and every write still lands
-/// as the real user. And the identity mapping is not enough either, because an
-/// ordinary user's shell has it. Both together are what root actually looks
-/// like.
+/// Neither half answers this alone. `geteuid()` says 0 inside a namespace too,
+/// so rootless podman's runtime believes it is root while every write lands as
+/// the real user; and an ordinary user's shell has the identity mapping.
 pub fn has_host_privilege() -> bool {
     rustix::process::geteuid().is_root() && in_initial_user_namespace()
 }
 
 /// Whether this process's user namespace is the one the kernel booted with.
-///
-/// Only that namespace passes the whole id space through unchanged, and a
-/// namespace that did so was made by something which already had the privilege
-/// to. On its own this is not enough — an ordinary user's shell is in the
-/// initial namespace too — which is why [`has_host_privilege`] asks for both.
+/// Only that one passes the whole id space through unchanged, and anything else
+/// that did was made by something already privileged enough to.
 fn in_initial_user_namespace() -> bool {
     std::fs::read_to_string("/proc/self/uid_map").map(|map| is_identity_map(&map)).unwrap_or(false)
 }
 
 /// The uid this process has *outside* its user namespace.
 ///
-/// A rootless runtime is uid 0 inside and something else outside, and the
-/// things it has to name — `/run/user/<uid>`, `user@<uid>.service`, the owner
-/// of a subordinate range — are named for the outside id. Asking `getuid()`
-/// gets the wrong one and the failure is a permission error on a path that
-/// belongs to root.
+/// The things a rootless runtime has to name — `/run/user/<uid>`,
+/// `user@<uid>.service`, the owner of a subordinate range — use the outside id.
+/// `getuid()` gives the inside one, and the failure is a permission error on a
+/// path belonging to root.
 pub fn host_uid() -> u32 {
     outside_id("/proc/self/uid_map", rustix::process::getuid().as_raw())
 }
@@ -123,11 +114,10 @@ pub struct IdRange {
 
 /// Maps the user's own id to 0 inside, and their subordinate range to the rest.
 ///
-/// An unprivileged process may only map its own id, which would give a
-/// container exactly one usable id. The subordinate ranges in `/etc/subuid` are
-/// how it gets more, and `newuidmap` is the only sanctioned way to claim them:
-/// it is setuid, it checks the request against those files, and it is the
-/// reason this shells out rather than writing `/proc/<pid>/uid_map` directly.
+/// An unprivileged process may only map its own id, which would leave a
+/// container one usable id. `/etc/subuid` is how it gets more, and `newuidmap`
+/// is the only sanctioned way to claim them: it is setuid and checks the
+/// request against those files, hence shelling out.
 pub struct SubUid {
     uid: u32,
     gid: u32,
@@ -247,8 +237,7 @@ mod tests {
 
     #[test]
     fn a_rootless_map_is_not_mistaken_for_the_initial_one() {
-        // What podman writes: uid 0 inside is the real user outside, and the
-        // rest comes from /etc/subuid. The process is root, over nothing.
+        // What podman writes: root over a namespace, nothing else.
         assert!(!is_identity_map("         0       1000          1\n"));
         assert!(!is_identity_map(
             "         0       1000          1\n         1     524288      65536\n"
@@ -258,8 +247,7 @@ mod tests {
 
     #[test]
     fn an_id_is_translated_out_through_the_row_that_covers_it() {
-        // What podman writes: uid 0 inside is the invoking user outside, and
-        // the subuid range follows it.
+        // What podman writes.
         let map = "         0       1000          1\n         1     524288      65536\n";
         assert_eq!(map_outward(map, 0), Some(1000));
         assert_eq!(map_outward(map, 1), Some(524_288));
@@ -310,8 +298,8 @@ mod tests {
 
     #[test]
     fn the_helper_is_asked_for_zero_then_the_subordinate_range() {
-        // 0 inside is the invoking user, so a container's root owns the files
-        // that user owns; 1 upwards comes from /etc/subuid.
+        // 0 inside is the invoking user, so a container's root owns that
+        // user's files; 1 upwards comes from /etc/subuid.
         let args = map_arguments(42, 1000, &[IdRange { start: 524_288, count: 65_536 }]);
         assert_eq!(args, ["42", "0", "1000", "1", "1", "524288", "65536"]);
     }

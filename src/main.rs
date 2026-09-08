@@ -37,8 +37,7 @@ struct Cli {
     #[arg(long, global = true)]
     systemd_cgroup: bool,
 
-    /// Accepted and unused. Podman passes these to every runtime, and a
-    /// runtime that rejected them could not be dropped in.
+    /// Accepted and unused. Podman passes these to every runtime.
     #[arg(long, global = true, value_name = "PATH")]
     log: Option<PathBuf>,
     #[arg(long, global = true, value_name = "FORMAT")]
@@ -46,10 +45,8 @@ struct Cli {
     #[arg(long, global = true)]
     debug: bool,
 
-    /// Ask the kernel to log every seccomp denial to the audit log.
-    ///
-    /// A denied syscall otherwise surfaces as an unexplained failure deep
-    /// inside a program you did not write.
+    /// Log every seccomp denial to the audit log, so a denial is a named
+    /// syscall rather than an unexplained failure inside the workload.
     #[arg(long, global = true)]
     seccomp_log: bool,
 
@@ -285,8 +282,8 @@ fn run(args: RunArgs) -> Result<i32> {
         args.pids,
     )?;
 
-    // The runtime's own pid is unique among the containers running at any one
-    // time, which is all the address and interface name need.
+    // Unique among the containers running at any one time, which is all the
+    // address and interface name need.
     let network = match args.net {
         NetworkMode::None => None,
         NetworkMode::Bridge if !idmap::has_host_privilege() => {
@@ -309,12 +306,11 @@ fn run(args: RunArgs) -> Result<i32> {
         network,
     };
 
-    // One scope per invocation. Phase 4 takes the id from the OCI caller.
+    // One scope per invocation. The OCI path takes the id from the caller.
     let id = cgroup::run_id();
     let driver = cgroup::driver_for_this_user(&id, None)?;
 
-    // The two seams pick their implementation from the same fact: whether this
-    // process has privilege over the host or only over a namespace.
+    // Both seams pick their implementation from the same fact.
     if idmap::has_host_privilege() {
         container::run(&spec, &Identity, driver.as_ref(), Namespaces::DEFAULT)
     } else {

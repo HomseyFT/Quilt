@@ -1,4 +1,4 @@
-//! Phase 1 acceptance, asserted on observable behaviour.
+//! Root-only acceptance, asserted on observable behaviour.
 //!
 //! Gated behind `QUILT_TEST_ROOT=1` so a plain `cargo test` stays safe. Run
 //! them with `scripts/root-tests.sh`, which builds as you and runs as root.
@@ -60,10 +60,8 @@ fn scopes() -> Vec<PathBuf> {
 
 /// Scopes made by `quilt run`, which names them `run-<pid>-<nanos>`.
 ///
-/// The bespoke-CLI tests assert that they leave none behind, and asserting on
-/// the whole `quilt/` subtree makes them fail for anything else that is there —
-/// an OCI container mid-test, or the wreckage of an interrupted run. Neither is
-/// what those tests are about.
+/// Those tests assert they leave none behind; asserting on the whole `quilt/`
+/// subtree would fail them for an OCI container mid-test instead.
 fn run_scopes() -> Vec<PathBuf> {
     scopes()
         .into_iter()
@@ -93,10 +91,9 @@ fn read_trim(path: PathBuf) -> String {
     std::fs::read_to_string(path).unwrap_or_default().trim().to_string()
 }
 
-/// Spawns a container that signals readiness by touching a marker on the
-/// rootfs, then sleeps, so the host can inspect it while it is running. The
-/// rootfs is a host directory, so the marker appearing means the mount setup
-/// finished and the workload is live.
+/// Spawns a container that touches a marker on the rootfs and then sleeps, so
+/// the host can inspect it while it runs. The rootfs is a host directory, so
+/// the marker appearing means setup finished and the workload is live.
 fn spawn_running(flags: &[&str], name: &str) -> (std::process::Child, PathBuf) {
     let marker = rootfs().join(name);
     std::fs::remove_file(&marker).ok();
@@ -215,9 +212,8 @@ fn nothing_mounted_inside_reaches_the_host() {
 #[test]
 fn quilts_own_setup_mounts_are_invisible_to_the_host_while_the_container_runs() {
     requires_root!();
-    // The after-the-fact check above would miss a mount that exists for the
-    // container's lifetime and is only torn down on exit. This one looks while
-    // the container is up, which is what the spec's phase 1 actually claims.
+    // The check above would miss a mount that exists for the container's
+    // lifetime and is torn down on exit. This one looks while it is up.
     let (mut child, marker) = spawn_running(&[], "quilt-running");
     let started = marker.exists();
 
@@ -269,11 +265,10 @@ fn a_readonly_bind_is_read_only_all_the_way_down() {
         panic!("could not mount the test submount: {mounted}");
     }
 
-    // Written after the mount, so it exists only on the tmpfs. Reading it from
-    // inside is what keeps this test honest: without it, a submount that never
-    // materialised leaves /mnt/ro/sub an ordinary directory in a read-only
-    // bind, the write below fails for the boring reason, and the test passes
-    // having proven nothing about AT_RECURSIVE.
+    // Written after the mount, so it exists only on the tmpfs. Without reading
+    // it from inside, a submount that never materialised would leave an
+    // ordinary directory in a read-only bind, the write below would fail for
+    // that reason, and the test would prove nothing about AT_RECURSIVE.
     std::fs::write(submount.join("marker"), "readable\n").unwrap();
 
     let bind = format!("{}:/mnt/ro", dir.display());
@@ -302,9 +297,8 @@ fn the_workloads_exit_code_is_the_runtimes_exit_code() {
 #[test]
 fn pid_one_ignores_a_signal_it_sends_itself() {
     requires_root!();
-    // A pid namespace's init only takes delivery of signals it has installed a
-    // handler for, when the sender is inside the namespace. Even SIGKILL is
-    // discarded, which is why a container cannot kill itself this way.
+    // A pid namespace's init only takes delivery of signals it has a handler
+    // for, when the sender is inside the namespace. Even SIGKILL is discarded.
     let out = quilt(&[], "kill -9 $$; echo survived");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "survived");
@@ -313,8 +307,7 @@ fn pid_one_ignores_a_signal_it_sends_itself() {
 #[test]
 fn a_process_other_than_pid_one_is_still_killable() {
     requires_root!();
-    // The immunity above belongs to pid 1, not to the namespace: a child dies
-    // normally, and its shell reports 128 + SIGKILL.
+    // The immunity above belongs to pid 1, not to the namespace.
     assert_eq!(inside("sh -c 'kill -9 $$'; echo $?").trim(), "137");
 }
 
@@ -359,9 +352,9 @@ fn the_limits_reach_the_scope_the_workload_is_in() {
 #[test]
 fn a_memory_limit_oom_kills_the_workload() {
     requires_root!();
-    // dd allocates a bs-sized buffer and touches all of it, so 64M of anonymous
-    // memory against a 16M ceiling has nowhere to go: reclaim cannot free it
-    // and memory.swap.max is 0, so the kernel has to kill something.
+    // dd touches all of a bs-sized buffer, so 64M of anonymous memory against a
+    // 16M ceiling has nowhere to go: reclaim cannot free it and
+    // memory.swap.max is 0.
     let out = quilt(&["--memory", "16M"], "dd if=/dev/zero of=/dev/null bs=64M count=1");
     let stderr = String::from_utf8_lossy(&out.stderr);
 
@@ -395,10 +388,9 @@ fn the_scope_is_gone_once_the_container_exits() {
 #[test]
 fn a_straggler_outliving_pid_one_does_not_leak_the_scope() {
     requires_root!();
-    // pid 1 exits at once while a child is still running. waitpid returns as
-    // soon as pid 1 is reaped, so the rest of the namespace is still being
-    // killed and reparented when the scope is torn down. Without cgroup.kill
-    // and the populated wait, the rmdir loses that race with EBUSY.
+    // pid 1 exits while a child is still running, so the namespace is still
+    // being torn down when the scope is. Without cgroup.kill and the populated
+    // wait, the rmdir loses that race with EBUSY.
     assert!(quilt(&[], "sleep 100 & exit 0").status.success());
 
     let leftover = run_scopes();
@@ -436,8 +428,7 @@ fn a_bridge_container_gets_an_address_and_a_default_route() {
 #[test]
 fn a_bridge_container_reaches_its_gateway() {
     requires_root!();
-    // The gateway is the bridge itself, so this passes with no internet and
-    // isolates the veth and routing from anything upstream.
+    // The gateway is the bridge itself, so this needs no internet.
     let out = quilt(&["--net", "bridge"], "ping -c 1 -W 3 10.88.0.1");
     assert!(
         out.status.success(),
@@ -451,8 +442,7 @@ fn a_bridge_container_reaches_its_gateway() {
 fn a_bridge_container_reaches_the_internet() {
     requires_root!();
     if !host_reaches_the_internet() {
-        // Only the NAT hop goes untested here; the veth, the bridge and the
-        // routing are covered by the gateway test, which needs no internet.
+        // Only the NAT hop goes untested; the gateway test covers the rest.
         eprintln!("skipped: the host cannot reach 1.1.1.1 either, so neither can a container");
         return;
     }
@@ -479,8 +469,8 @@ fn the_veth_does_not_outlive_the_container() {
 #[test]
 fn the_bridge_is_shared_rather_than_recreated() {
     requires_root!();
-    // quilt0 outlives containers on purpose: it is the shared fabric, and
-    // tearing it down would cut off anything else still attached.
+    // quilt0 outlives containers on purpose: tearing it down would cut off
+    // anything else still attached.
     assert_eq!(inside_with(&["--net", "bridge"], "echo done").trim(), "done");
     assert!(host_links().contains(&"quilt0".to_string()), "the bridge went away");
 }
@@ -560,12 +550,10 @@ fn write_bundle_with(dir: &PathBuf, args: &str, process_extra: &str, linux_extra
 
 /// Runs `create`, keeping the container's stdio off pipes.
 ///
-/// The init process inherits create's descriptors and outlives it, parked on
-/// the exec fifo. `Command::output()` waits for EOF on the pipes it creates, so
-/// piping either stream deadlocks: the test would be waiting on init, which is
-/// waiting on the `start` the test has not reached yet. Files have no such
-/// property. A real caller does the same thing for the same reason — conmon
-/// hands the runtime the descriptors it wants the container to have.
+/// init inherits create's descriptors and outlives it, parked on the exec
+/// fifo. `Command::output()` waits for EOF on the pipes it makes, so piping
+/// either stream deadlocks: the test waits on init, which waits on the `start`
+/// the test has not reached. Conmon hands over descriptors for the same reason.
 fn create_container(state_root: &PathBuf, bundle: &PathBuf, id: &str, log: &PathBuf) -> String {
     let stdout = std::fs::File::create(log).unwrap();
     let errors = log.with_extension("err");
@@ -588,9 +576,8 @@ fn create_container(state_root: &PathBuf, bundle: &PathBuf, id: &str, log: &Path
 
 /// `create` where the bundle is expected to be refused. Returns its stderr.
 ///
-/// Redirected for the same reason as `create_container`: on the paths where
-/// create *succeeds*, `Command::output()` would wait for an init process that
-/// is parked on the exec fifo and will not close its stdio until `start`.
+/// Redirected for the same reason as `create_container`: where create
+/// *succeeds*, `Command::output()` would wait on an init parked on the fifo.
 fn try_create_container(state_root: &PathBuf, bundle: &PathBuf, id: &str) -> (bool, String) {
     let work = state_root.with_extension("create-log");
     std::fs::create_dir_all(&work).unwrap();
@@ -660,8 +647,8 @@ fn the_lifecycle_verbs_drive_a_container_from_create_to_delete() {
     }
 
     let output = std::fs::read_to_string(&log).unwrap();
-    // init's own stderr goes here, and it is the only place a failure between
-    // `start` and `execve` says anything.
+    // init's stderr, the only place a failure between `start` and `execve`
+    // says anything.
     let errors = std::fs::read_to_string(log.with_extension("err")).unwrap_or_default();
     let deleted = quilt_oci(&state_root, &["delete", "lifecycle-test"]);
     let leftover = scope_of("lifecycle-test").exists();
@@ -680,10 +667,9 @@ fn the_lifecycle_verbs_drive_a_container_from_create_to_delete() {
 #[test]
 fn a_container_can_run_as_a_user_other_than_root() {
     requires_root!();
-    // Everything else here runs as uid 0, where the capability passes can be in
-    // either order and nothing notices. Moving off uid 0 empties the effective
-    // set, so a bounding-set sweep after the user change fails every drop with
-    // EPERM and the container never starts.
+    // Everything else runs as uid 0, where the two capability passes can be in
+    // either order. Moving off uid 0 empties the effective set, so a
+    // bounding-set sweep after the user change fails every drop with EPERM.
     let work = std::env::temp_dir().join("quilt-oci-user");
     std::fs::remove_dir_all(&work).ok();
     let bundle = write_bundle_as(
@@ -758,15 +744,13 @@ fn an_unknown_container_is_an_error_not_a_panic() {
     std::fs::remove_dir_all(&state_root).ok();
 }
 
-/// The phase 4 demo, now with the container's real seccomp profile applied:
-/// `--security-opt seccomp=unconfined` is gone, which is what phase 5 was for.
-/// The two flags left are non-goals, explained in SPEC.md.
+/// The podman demo with the container's real seccomp profile applied. The two
+/// flags left are non-goals, explained in SPEC.md.
 ///
-/// This is the phase's headline acceptance criterion, so it is not allowed to
-/// skip itself into the green over a missing image: `scripts/root-tests.sh`
-/// sets QUILT_TEST_PODMAN=1 and this then insists on running. Anyone without a
-/// registry to pull from can leave the variable unset, and is told the
-/// criterion went unchecked.
+/// The headline acceptance criterion, so it may not skip itself into the green
+/// over a missing image: `scripts/root-tests.sh` sets QUILT_TEST_PODMAN=1 and
+/// this then insists on running. Leaving it unset says the criterion went
+/// unchecked.
 #[test]
 fn podman_runs_a_container_end_to_end_through_quilt() {
     requires_root!();
@@ -850,8 +834,8 @@ fn run_with_seccomp(name: &str, args: &str, seccomp: &str) -> (String, String) {
 #[test]
 fn a_denied_syscall_returns_an_errno_rather_than_killing_the_container() {
     requires_root!();
-    // The spec's own argument for preferring an errno: the workload keeps
-    // running and says which call failed, instead of leaving a corpse.
+    // Why an errno beats a kill: the workload keeps running and says which
+    // call failed.
     let (output, errors) = run_with_seccomp(
         "seccomp-errno",
         r#""/bin/sh", "-c", "chmod 777 /tmp 2>/dev/null; echo rc=$?; echo alive""#,
@@ -896,11 +880,10 @@ fn an_allowed_syscall_is_untouched_by_the_filter() {
 #[test]
 fn a_kill_action_kills_the_caller_rather_than_returning_an_error() {
     requires_root!();
-    // SCMP_ACT_KILL_PROCESS ends the process that made the call — here the
-    // `chmod` the shell forked, not the shell — so the shell lives on to report
-    // how its child died. That exit status is the whole assertion, and it tells
-    // the three outcomes apart: 0 means the filter never applied, 1 means it
-    // returned EPERM as in the test above, and 159 is 128 + SIGSYS.
+    // SCMP_ACT_KILL_PROCESS ends the process that made the call — the `chmod`
+    // the shell forked, not the shell — so the shell reports how its child
+    // died. That status tells the outcomes apart: 0 means the filter never
+    // applied, 1 means EPERM as in the test above, 159 is 128 + SIGSYS.
     let (output, errors) = run_with_seccomp(
         "seccomp-kill",
         r#""/bin/sh", "-c", "chmod 777 /tmp; echo rc=$?""#,
@@ -922,8 +905,7 @@ fn a_kill_action_kills_the_caller_rather_than_returning_an_error() {
 fn a_profile_quilt_cannot_build_is_refused_before_the_container_starts() {
     requires_root!();
     // SCMP_ACT_NOTIFY needs a user-space agent on the other end of a
-    // descriptor. Accepting the bundle and running it unfiltered would look
-    // exactly like success.
+    // descriptor. Running it unfiltered would look exactly like success.
     let work = std::env::temp_dir().join("quilt-seccomp-notify");
     std::fs::remove_dir_all(&work).ok();
     let bundle = write_bundle_with(

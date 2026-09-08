@@ -1,15 +1,12 @@
 //! Rootless connectivity, handed to `pasta`.
 //!
-//! The veth and bridge in `veth.rs` need CAP_NET_ADMIN on the host: creating a
-//! link, attaching it to a bridge and adding a NAT rule are all privileged, and
-//! no amount of user-namespace root buys them. `pasta` solves it from the other
-//! end — it joins the container's network namespace, puts a tap interface in
-//! it, and runs a TCP/IP stack in user space that forwards through ordinary
-//! sockets owned by the invoking user.
+//! The veth and bridge in `veth.rs` need CAP_NET_ADMIN on the host, which
+//! user-namespace root does not buy. `pasta` works from the other end: it joins
+//! the container's network namespace, puts a tap interface in it, and runs a
+//! TCP/IP stack in user space over ordinary sockets owned by the invoking user.
 //!
-//! Shelling out is the same bargain phase 6 makes with `newuidmap`: pasta is
-//! the sanctioned way an unprivileged process gets this, and reimplementing a
-//! user-space network stack is a different project.
+//! Shelling out is the same bargain as `newuidmap` — the sanctioned way an
+//! unprivileged process gets this.
 
 use rustix::process::Pid;
 
@@ -23,16 +20,14 @@ use crate::error::{Context, Error, Result};
 pub fn connect(pid: Pid) -> Result<()> {
     let pid = pid.as_raw_nonzero().get();
 
-    // Both namespaces, not just the network one. The container's netns is owned
-    // by the user namespace the clone made, and joining a netns needs
-    // CAP_SYS_ADMIN in its owner — which pasta only has once it is inside. Given
-    // a bare pid it joins the netns alone and is refused.
+    // Both namespaces, not just the network one: the netns is owned by the
+    // user namespace the clone made, and joining a netns needs CAP_SYS_ADMIN in
+    // its owner. Given a bare pid, pasta joins the netns alone and is refused.
     let output = std::process::Command::new("pasta")
         .arg("--config-net")
-        // That watch is for a namespace bound into /run/netns, which pasta
-        // polls to know when to exit. The container's is a live process's
-        // namespace instead, so there is nothing there to watch and the attempt
-        // fails on a directory that belongs to root.
+        // That watch is for a namespace bound into /run/netns. The container's
+        // belongs to a live process, so there is nothing to watch and the
+        // attempt fails on a directory owned by root.
         .arg("--no-netns-quit")
         .arg("--userns")
         .arg(format!("/proc/{pid}/ns/user"))

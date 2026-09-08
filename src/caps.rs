@@ -9,8 +9,7 @@ use crate::error::{Context, Error, Result};
 use crate::spec;
 use crate::syscall;
 
-/// The OCI spec names capabilities; the kernel numbers them. Ordered by number,
-/// which `capability_number` relies on for nothing but readability.
+/// The OCI spec names capabilities; the kernel numbers them.
 const CAPABILITIES: &[(&str, u32)] = &[
     ("CAP_CHOWN", 0),
     ("CAP_DAC_OVERRIDE", 1),
@@ -56,15 +55,14 @@ const CAPABILITIES: &[(&str, u32)] = &[
 ];
 
 /// The highest capability this kernel could know about. Dropping past the end
-/// of what it supports is harmless and is how the bounding set is swept.
+/// of what it supports is harmless, and is how the bounding set is swept.
 const MAX_CAPABILITY: u32 = 63;
 
 fn capability_number(name: &str) -> Result<u32> {
     CAPABILITIES.iter().find(|(known, _)| *known == name).map(|(_, number)| *number).ok_or_else(
         || {
-            // Not a warning. A capability quilt does not recognise is one it
-            // cannot decide to withhold, and granting the rest as if the list
-            // were complete is the quiet failure this phase is about.
+            // A capability quilt does not recognise is one it cannot withhold,
+            // so granting the rest would be a silent over-grant.
             Error::msg(format!("config.json names a capability quilt does not know: {name}"))
         },
     )
@@ -79,11 +77,8 @@ fn mask(names: &[String]) -> Result<u64> {
     Ok(bits)
 }
 
-/// Checks the names without changing anything.
-///
-/// `create` uses this so a bundle it could not carry out is refused while it is
-/// still a bundle, rather than at `start`, by which point `create` has already
-/// told the caller the container exists.
+/// Checks the names without changing anything, so `create` can refuse a bundle
+/// it could not carry out before telling the caller the container exists.
 pub fn validate(capabilities: &spec::Capabilities) -> Result<()> {
     if !capabilities.ambient.is_empty() {
         return Err(Error::msg(
@@ -103,19 +98,16 @@ pub fn validate(capabilities: &spec::Capabilities) -> Result<()> {
 
 /// Narrows the bounding set to what the bundle asked for.
 ///
-/// This half runs *before* the process changes user, and the order is not a
-/// preference. `PR_CAPBSET_DROP` needs `CAP_SETPCAP` in the effective set, and
-/// any move off uid 0 empties the effective set outright — `PR_SET_KEEPCAPS`
-/// preserves the permitted set, not the effective one (capabilities(7)). Doing
-/// it after would fail every drop with EPERM.
+/// Runs *before* the process changes user, and must. `PR_CAPBSET_DROP` needs
+/// `CAP_SETPCAP` in the effective set, and any move off uid 0 empties effective
+/// outright — `PR_SET_KEEPCAPS` preserves permitted, not effective
+/// (capabilities(7)) — so doing it after fails every drop with EPERM.
 ///
-/// It is also harmless to the user change that follows: the bounding set is a
-/// ceiling on what can be gained, so dropping `CAP_SETUID` and `CAP_SETGID`
-/// from it leaves the copies in effective and permitted alone, and `setgroups`
-/// still works.
+/// It does not disturb the user change either: the bounding set only caps what
+/// can be gained, so dropping `CAP_SETGID` from it leaves the copy in effective
+/// alone and `setgroups` still works.
 pub fn narrow_bounding(capabilities: &spec::Capabilities) -> Result<()> {
-    // Checked here too because this is the first of the two passes, and
-    // refusing before anything has changed beats refusing halfway through.
+    // The first of the two passes, so refuse before anything has changed.
     validate(capabilities)?;
 
     let bounding = mask(&capabilities.bounding)?;
@@ -141,9 +133,9 @@ pub fn narrow_bounding(capabilities: &spec::Capabilities) -> Result<()> {
 
 /// Applies the effective, permitted and inheritable sets.
 ///
-/// This half runs *after* the user change, so these are the sets the workload
-/// actually keeps. Raising effective out of permitted needs no privilege of its
-/// own, which is why this half survives the transition that the other could not.
+/// Runs *after* the user change, so these are the sets the workload keeps.
+/// Raising effective out of permitted needs no privilege, which is why this
+/// half survives a transition the other could not.
 pub fn apply_sets(capabilities: &spec::Capabilities) -> Result<()> {
     rustix::thread::set_capabilities(
         None,
@@ -178,8 +170,7 @@ mod tests {
 
     #[test]
     fn an_unknown_capability_is_refused_rather_than_ignored() {
-        // Silently skipping it would grant everything else and look like it
-        // worked.
+        // Skipping it would grant everything else and look like it worked.
         assert!(capability_number("CAP_INVENTED").is_err());
         assert!(mask(&names(&["CAP_CHOWN", "CAP_INVENTED"])).is_err());
     }
@@ -223,8 +214,7 @@ mod tests {
         ]);
         let bits = mask(&podman).unwrap();
 
-        // CAP_SETPCAP has to survive into the bounding set pass, which is what
-        // lets the rest be dropped.
+        // CAP_SETPCAP has to survive into the bounding-set pass.
         assert_ne!(bits & (1 << 8), 0);
         assert_eq!(bits.count_ones(), 11);
     }

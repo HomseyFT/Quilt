@@ -1,15 +1,14 @@
 #!/bin/sh
 # Capture what `ip` puts on the netlink wire, for the golden byte tests.
 #
-# An nlmon interface taps netlink itself — but it taps ALL of it, not just ours.
-# NetworkManager, firewalld and podman are all talking on the same bus, so the
-# extractor filters on the interface the message is about rather than taking the
-# first thing that structurally resembles a request. Without that, an unrelated
-# nftables message can contain a byte offset whose length and type fields happen
-# to look plausible, and it gets written out as truth.
+# An nlmon interface taps ALL of netlink, not just ours: NetworkManager,
+# firewalld and podman share the bus. So the extractor filters on the interface
+# a message is about rather than the first thing that structurally resembles a
+# request — an unrelated nftables message can hold a byte offset whose length
+# and type fields look plausible.
 #
-# When a capture finds nothing it prints every request it did see, so the reason
-# is visible rather than guessed at. QUILT_CAPTURE_DEBUG=1 prints that always.
+# A capture that finds nothing prints every request it did see.
+# QUILT_CAPTURE_DEBUG=1 prints that always.
 #
 # Needs root. Re-run whenever the message builders change; commit tests/golden/.
 set -eu
@@ -41,10 +40,10 @@ ip link set nlmon0 up
 
 # capture <output> <comma-separated nlmsg types> name|index <value> <command...>
 #
-# How a message identifies its interface depends on the message: `ip link add`
-# carries IFLA_IFNAME, while `ip link set` resolves the name up front and sends
-# only ifi_index. Several message types are accepted for the same reason —
-# iproute2 and quilt can legitimately choose different ones for the same intent.
+# How a message names its interface varies: `ip link add` carries IFLA_IFNAME,
+# `ip link set` resolves the name up front and sends only ifi_index. Several
+# message types are accepted because iproute2 and quilt can choose different
+# ones for the same intent.
 capture() {
     out="tests/golden/$1"
     want_types=$2
@@ -188,9 +187,8 @@ PY
     set -e
     rm -f "$pcap"
 
-    # Per capture, not at the end: this script runs under sudo and can abort
-    # part way, and a root-owned golden cannot be rewritten or removed by the
-    # user who has to commit it.
+    # Per capture, not at the end: this runs under sudo and can abort part way,
+    # leaving a root-owned golden the user cannot rewrite.
     if [ -n "${SUDO_UID:-}" ] && [ -f "$out" ]; then
         chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$out"
     fi
@@ -203,10 +201,9 @@ capture bridge-add.hex 16 name quilt0 \
     ip link add quilt0 type bridge
 ip link del quilt0 2>/dev/null || true
 
-# Deliberately without `netns`: iproute2 resolves that argument to an open
-# descriptor and sends IFLA_NET_NS_FD, while quilt has the child's pid and
-# sends IFLA_NET_NS_PID. There is no invocation of `ip` that produces quilt's
-# shape, so the netns attribute is pinned by a unit test instead and the
+# Without `netns`: iproute2 resolves it to a descriptor and sends
+# IFLA_NET_NS_FD, while quilt has a pid and sends IFLA_NET_NS_PID. No `ip`
+# invocation produces quilt's shape, so a unit test pins that attribute and the
 # capture covers the rest of the nest.
 capture veth-add.hex 16 name qvgolden \
     ip link add qvgolden type veth peer name eth0

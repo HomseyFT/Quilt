@@ -1,8 +1,8 @@
 //! Raw syscalls for the interfaces `rustix` does not wrap.
 //!
-//! `clone3`, `close_range` and `mount_setattr` all sit on rustix's
-//! `not_implemented!` list. The register convention is written out once here;
-//! the typed wrappers live next to the code that uses them.
+//! `clone3`, `close_range` and `mount_setattr` sit on rustix's
+//! `not_implemented!` list. The register convention lives here; the typed
+//! wrappers live next to the code that uses them.
 
 use rustix::io::Errno;
 
@@ -18,9 +18,8 @@ pub const PR_CAPBSET_DROP: u64 = 24;
 pub const AT_FDCWD: u64 = -100i64 as u64;
 pub const AT_RECURSIVE: u64 = 0x8000;
 
-/// Splits a raw syscall return into a value or an errno. The kernel returns
-/// `-errno` in the same register as the result, and no valid return lands in
-/// the last page of the address space.
+/// The kernel returns `-errno` in the same register as the result. No valid
+/// return lands in the last page of the address space, which is the window.
 pub fn result(ret: i64) -> Result<i64, Errno> {
     if (-4095..0).contains(&ret) { Err(Errno::from_raw_os_error(-ret as i32)) } else { Ok(ret) }
 }
@@ -97,12 +96,10 @@ pub unsafe fn close_range(first: u32, last: u32, flags: u32) -> Result<(), Errno
     result(ret).map(|_| ())
 }
 
-/// `prctl(option, arg2, 0, 0, 0)`.
-///
-/// rustix wraps most of `prctl`, but its capability calls are keyed by a
-/// `Capability` enum, and quilt works in the raw numbers the OCI spec's
-/// capability names map onto. The unused arguments are passed as zero rather
-/// than left undefined: several options do read them.
+/// `prctl(option, arg2, 0, 0, 0)`. Not rustix's: its capability calls are keyed
+/// by a `Capability` enum, and quilt works in raw numbers. The trailing
+/// arguments are zeroed rather than left undefined, since some options read
+/// them.
 pub fn prctl_2(option: u64, arg2: u64) -> Result<(), Errno> {
     let ret = unsafe { syscall5(SYS_PRCTL, option, arg2, 0, 0, 0) };
     result(ret).map(|_| ())

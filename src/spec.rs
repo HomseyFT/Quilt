@@ -1,15 +1,11 @@
 //! The OCI runtime `config.json`.
 //!
-//! The runtime spec is large and most of it does not apply here, so this covers
-//! what podman actually sends for a `podman run` — captured from a real
-//! invocation, not guessed; `tests/fixtures/` holds those captures and the unit
-//! tests parse them.
+//! Covers what podman actually sends for a `podman run`, captured rather than
+//! guessed; `tests/fixtures/` holds the captures and the unit tests parse them.
 //!
-//! `process` and `linux` deny unknown fields on purpose. They are where the
-//! security-bearing settings live, and a field quilt has never heard of is
-//! exactly the one it must not skip past. The cost is that a future podman
-//! adding a field makes quilt complain rather than quietly ignore it, which is
-//! the trade the spec asks for.
+//! Unknown fields are denied on purpose: a field quilt has never heard of is
+//! the one it must not skip past. The cost is that a future podman adding one
+//! makes quilt complain rather than quietly ignore it.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -236,9 +232,8 @@ pub enum NamespaceKind {
     Time,
 }
 
-/// Only ever appears where quilt refuses the bundle outright, so nothing reads
-/// the rows; they exist so that such a bundle parses far enough to be refused
-/// with a useful message.
+/// Nothing reads the rows: they exist so a bundle carrying them parses far
+/// enough to be refused with a useful message.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[allow(dead_code)]
@@ -342,23 +337,19 @@ pub struct Pids {
 impl Resources {
     /// The first resource control that is set and that quilt does not write.
     ///
-    /// Some of these are only performance, but `devices` is the cgroup device
-    /// allowlist and `unified` writes arbitrary cgroup files, so the set has to
-    /// be refused as a whole rather than sorted into important and not.
+    /// Refused as a set: some are only performance, but `devices` is the cgroup
+    /// device allowlist and `unified` writes arbitrary cgroup files.
     fn unsupported(&self) -> Option<&'static str> {
         let listed = [
             ("linux.resources.blockIO", self.block_io.is_some()),
             ("linux.resources.hugepageLimits", !self.hugepage_limits.is_empty()),
             ("linux.resources.network", self.network.is_some()),
             ("linux.resources.rdma", self.rdma.is_some()),
-            // Not simply "is it set". Every podman bundle carries a single
-            // blanket deny and leaves the runtime to permit the nodes it then
-            // creates. quilt reaches that same end by construction: the
-            // container's /dev holds exactly the nodes the runtime put there
-            // and nothing else, so a list that permits nothing is a list quilt
-            // already satisfies. A rule that *allows* a device is one it would
-            // have to enforce, and cannot — cgroup v2 does that with an eBPF
-            // program attached to the scope.
+            // Not simply "is it set": every podman bundle carries a blanket
+            // deny, which quilt satisfies by construction, since the
+            // container's /dev holds only the nodes the runtime created. A rule
+            // that *allows* a device would have to be enforced, and cgroup v2
+            // does that with an eBPF program attached to the scope.
             ("linux.resources.devices", self.devices.iter().any(|rule| rule.allow)),
             ("linux.resources.unified", !self.unified.is_empty()),
         ];
@@ -411,9 +402,9 @@ impl Config {
 
     /// Refuses anything security-bearing that quilt does not implement.
     ///
-    /// The failure this guards against is not a wrong answer, it is a quiet
-    /// one: accepting a bundle that asks for a syscall filter and running it
-    /// without any filter at all looks exactly like success.
+    /// The failure guarded against is the quiet one: accepting a bundle that
+    /// asks for a syscall filter and then running it without any filter looks
+    /// exactly like success.
     pub fn validate(&self) -> Result<()> {
         if !self.oci_version.starts_with("1.") {
             return Err(Error::msg(format!(
@@ -450,8 +441,7 @@ impl Config {
                     .to_string(),
             ));
         }
-        // Named so the bundle parses, and refused so it is not quietly dropped.
-        // `deny_unknown_fields` guarantees quilt has *seen* every field; these
+        // `deny_unknown_fields` guarantees quilt has seen every field; these
         // are the ones it has seen and cannot carry out.
         for (field, present) in [
             ("process.oomScoreAdj", self.process.oom_score_adj.is_some()),
@@ -471,9 +461,8 @@ impl Config {
             }
         }
 
-        // Per-mount id mappings are idmapped mounts, which need CAP_SYS_ADMIN in
-        // the namespace owning the filesystem's superblock — see the phase 6
-        // notes in SPEC.md for why that is not something quilt can arrange.
+        // Idmapped mounts need CAP_SYS_ADMIN in the namespace owning the
+        // filesystem's superblock; SPEC.md's phase 6 has the measurements.
         if self.mounts.iter().any(|m| !m.uid_mappings.is_empty() || !m.gid_mappings.is_empty()) {
             return Err(Error::msg(
                 "config.json asks for an idmapped mount, which quilt does not create".to_string(),
@@ -496,8 +485,7 @@ impl Config {
         if let Some(path) = &self.linux.cgroups_path {
             // The systemd form is slice:prefix:name, and honouring it means
             // asking systemd for a transient scope over dbus rather than
-            // writing cgroup files. That is a different project, and doing it
-            // by hand underneath systemd would fight the manager.
+            // writing cgroup files.
             if path.contains(':') {
                 return Err(Error::msg(format!(
                     "cgroupsPath {path:?} is the systemd form, and quilt writes cgroup files \
@@ -533,9 +521,8 @@ mod tests {
         assert!(config.linux.seccomp.is_some());
     }
 
-    /// Every field podman sends must be named by a struct, or `deny_unknown_fields`
-    /// fails the parse. That is the point: an unrecognised field in `process`
-    /// or `linux` is the one most likely to matter.
+    /// Every field podman sends must be named by a struct, or
+    /// `deny_unknown_fields` fails the parse.
     #[test]
     fn the_config_podman_sends_with_security_options_off_parses() {
         let config = Config::parse(&fixture("podman-unconfined.json")).unwrap();
@@ -545,8 +532,8 @@ mod tests {
 
     #[test]
     fn a_default_bundle_is_still_refused_for_its_selinux_label() {
-        // Seccomp is no longer a reason to refuse; the process label is, and
-        // the error names the flag that removes it.
+        // The process label is what refuses this one, and the error names the
+        // flag that removes it.
         let config = Config::parse(&fixture("podman-default.json")).unwrap();
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("SELinux"), "{error}");
@@ -591,8 +578,7 @@ mod tests {
 
     #[test]
     fn a_device_list_that_permits_nothing_is_the_one_podman_sends() {
-        // A blanket deny asks for no access quilt grants, so accepting it does
-        // not weaken anything.
+        // A blanket deny asks for no access quilt grants.
         let json = r#"{
             "ociVersion": "1.2.1",
             "process": {"args": ["true"]},
@@ -604,8 +590,7 @@ mod tests {
 
     #[test]
     fn a_device_rule_that_permits_something_is_refused() {
-        // This one quilt would have to enforce, and cgroup v2 enforces it with
-        // an eBPF program attached to the scope.
+        // This one quilt would have to enforce with an eBPF program.
         let json = r#"{
             "ociVersion": "1.2.1",
             "process": {"args": ["true"]},

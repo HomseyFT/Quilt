@@ -1,9 +1,7 @@
 //! The re-exec'd child: `quilt init`.
 //!
-//! A fresh image, already inside the new namespaces. Nothing from the parent
-//! leaks in, and the mount plan runs where its effects belong. In phase 4 this
-//! is also where the exec fifo blocks between `create` and `start`; phase 5
-//! adds seccomp and the capability drop immediately before the `execve` below.
+//! A fresh image, already inside the new namespaces, so the mount plan runs
+//! where its effects belong and nothing from the parent leaks in.
 
 use std::ffi::CString;
 use std::os::fd::FromRawFd;
@@ -28,9 +26,8 @@ pub fn exec(spec: InitSpec) -> Result<std::convert::Infallible> {
 
     StandardMounts::new(spec.readonly_binds).prepare(&spec.rootfs)?.apply()?;
 
-    // After the mount plan, because the interface index comes out of sysfs and
-    // sysfs is mounted by that plan. It is the container's own sysfs, so it
-    // shows the container's netns.
+    // After the mount plan: the interface index comes out of sysfs, which that
+    // plan mounts, and it is the container's own.
     if let Some(endpoint) = &spec.network {
         veth::configure(endpoint)?;
     }
@@ -89,10 +86,10 @@ pub fn parse_bind(value: &str) -> Result<BindSpec> {
 // ---------------------------------------------------------------------------
 // The OCI init process.
 //
-// Launched by `create`, it does the setup, reports that it survived it, and
-// then parks on the exec fifo until `start` opens the other end. Everything
-// that reduces privilege happens after that wait, because the setup needs the
-// privileges the workload must not keep.
+// Launched by `create`, it does the setup, reports that it survived, and parks
+// on the exec fifo until `start` opens the other end. Everything that reduces
+// privilege happens after that wait, since the setup needs what the workload
+// must not keep.
 // ---------------------------------------------------------------------------
 
 pub struct OciInit {
@@ -110,9 +107,8 @@ pub fn exec_oci(init: OciInit) -> Result<std::convert::Infallible> {
         .context(|| format!("reading {}", config_path.display()))?;
     let config = crate::spec::Config::parse(&json)?;
 
-    // Namespaces the caller pre-created. First, because the sysctls below and
-    // the sysfs mount in the plan are both scoped to whichever namespace this
-    // process is in by then.
+    // Namespaces the caller pre-created. First: the sysctls below and the
+    // plan's sysfs mount are scoped to whichever namespace this process is in.
     crate::ns::join_all(&config.linux.namespaces)?;
 
     if !config.hostname.is_empty() {
@@ -120,13 +116,12 @@ pub fn exec_oci(init: OciInit) -> Result<std::convert::Infallible> {
             .context(|| format!("setting hostname to {:?}", config.hostname))?;
     }
 
-    // Before the mount plan, deliberately. These are written through /proc,
-    // and the plan makes the container's own /proc/sys read-only.
+    // Before the mount plan: these go through /proc, which the plan makes
+    // read-only.
     apply_sysctls(&config.linux.sysctl)?;
 
-    // The fifo lives outside the container, and `pivot_root` is about to put it
-    // out of reach by name. A directory descriptor survives that, and `openat`
-    // through it does not go near path resolution.
+    // `pivot_root` is about to put the fifo out of reach by name. A directory
+    // descriptor survives that, and `openat` through it needs no path.
     let fifo_dir = init
         .fifo
         .parent()
@@ -190,16 +185,15 @@ pub fn exec_oci(init: OciInit) -> Result<std::convert::Infallible> {
     rustix::process::chdir(&config.process.cwd)
         .context(|| format!("chdir to {}", config.process.cwd.display()))?;
 
-    // Everything the filter would have to permit for quilt's own sake happens
-    // first. Searching PATH stats candidate files, and `chdir` above is a
-    // syscall the container has no reason to be allowed — resolving both now
-    // leaves `execve` as the only thing between the filter and the workload.
+    // Resolved before the filter is installed, so that `execve` is the only
+    // syscall between it and the workload: searching PATH stats candidates, and
+    // a profile has no reason to permit that.
     let (program, argv, envp) = oci_workload(&config.process.args, &config.process.env)?;
     let argv_ptrs = pointer_array(&argv);
     let envp_ptrs = pointer_array(&envp);
 
-    // Last, and deliberately so: the setup above needs mount, pivot_root and
-    // writes to cgroup files, which is exactly what a container's policy denies.
+    // Last: the setup above needs mount, pivot_root and cgroup writes, which is
+    // what a container's own policy denies.
     if let Some(profile) = &config.linux.seccomp {
         let filter = crate::seccomp::compile(profile)?;
         crate::seccomp::install(&filter, init.seccomp_log)?;
@@ -223,10 +217,7 @@ fn signal_ready(fd: std::os::fd::RawFd) -> Result<()> {
 }
 
 /// Sysctls that belong to a namespace, and so are the container's to set.
-///
-/// Everything else reaches the whole machine. A bundle asking for one of those
-/// is asking the runtime to reconfigure the host, and quietly obliging is worse
-/// than refusing.
+/// Everything else reaches the whole machine.
 fn is_namespaced_sysctl(key: &str) -> bool {
     const NAMESPACED: &[&str] = &[
         "kernel.domainname",
@@ -313,8 +304,7 @@ fn apply_user(user: &crate::spec::User) -> Result<()> {
     rustix::thread::set_thread_groups(&groups)
         .context(|| "setting supplementary groups".to_string())?;
 
-    // The ids come from the bundle; the kernel decides whether this process is
-    // allowed to assume them.
+    // The kernel decides whether this process may assume them.
     let gid = rustix::process::Gid::from_raw(user.gid);
     let uid = rustix::process::Uid::from_raw(user.uid);
     rustix::thread::set_thread_res_gid(gid, gid, gid)
@@ -322,10 +312,8 @@ fn apply_user(user: &crate::spec::User) -> Result<()> {
     rustix::thread::set_thread_res_uid(uid, uid, uid).context(|| "setting the user id".to_string())
 }
 
-/// Where a bare `args[0]` might be, in the order PATH gives.
-///
-/// A name with a slash in it is a path already and is used as it stands, the
-/// same rule a shell follows.
+/// Where a bare `args[0]` might be, in the order PATH gives. A name containing
+/// a slash is already a path, the same rule a shell follows.
 fn program_candidates(program: &str, env: &[String]) -> Vec<PathBuf> {
     if program.contains('/') {
         return vec![PathBuf::from(program)];
@@ -349,8 +337,8 @@ fn is_executable(path: &Path) -> bool {
 /// Finds the program the bundle asked for, inside the container.
 ///
 /// `process.args[0]` is a command name, not necessarily a path: podman sends
-/// `["ls", "/"]` and expects the runtime to search `process.env`'s PATH, which
-/// is why this runs after the pivot rather than before it.
+/// `["ls", "/"]` and expects the runtime to search `process.env`'s PATH. Hence
+/// after the pivot.
 fn resolve_program(program: &str, env: &[String]) -> Result<CString> {
     let candidates = program_candidates(program, env);
 
