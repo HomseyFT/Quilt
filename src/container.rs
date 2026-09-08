@@ -27,7 +27,16 @@ pub struct RunSpec {
     pub argv: Vec<String>,
     pub limits: Limits,
     /// `None` is `--net none`: a network namespace with only loopback in it.
-    pub network: Option<veth::Plan>,
+    pub network: Option<Connectivity>,
+}
+
+/// How the container reaches the outside, if it does.
+pub enum Connectivity {
+    /// Privileged: a veth onto quilt's bridge, configured by init.
+    Bridge(veth::Plan),
+    /// Unprivileged: pasta configures the namespace from outside, so init has
+    /// nothing to do.
+    Pasta,
 }
 
 /// Exit code used when the init process could not be reached or execed. 127 is
@@ -101,13 +110,20 @@ pub fn run(
             // init configures the container end and the veth has to be there.
             // `HostLink` deletes the pair on the way out of this scope.
             let _link = match &spec.network {
-                Some(plan) => match veth::connect(plan, child) {
+                Some(Connectivity::Bridge(plan)) => match veth::connect(plan, child) {
                     Ok(link) => Some(link),
                     Err(e) => {
                         kill_and_reap(child);
                         return Err(e);
                     }
                 },
+                Some(Connectivity::Pasta) => {
+                    if let Err(e) = crate::net::pasta::connect(child) {
+                        kill_and_reap(child);
+                        return Err(e);
+                    }
+                    None
+                }
                 None => None,
             };
             if let Err(e) = rustix::io::write(&map_done, &[1u8])
@@ -140,7 +156,9 @@ fn init_argv(spec: &RunSpec) -> Vec<String> {
         argv.push("--ro".to_string());
         argv.push(format!("{}:{}", bind.source.display(), bind.destination.display()));
     }
-    if let Some(plan) = &spec.network {
+    // Only the bridge needs init to do anything: pasta has already given the
+    // namespace an address and a route by the time init is released.
+    if let Some(Connectivity::Bridge(plan)) = &spec.network {
         argv.push("--net-address".to_string());
         argv.push(format!("{}/{}", plan.endpoint.address, plan.endpoint.prefix_len));
         argv.push("--net-gateway".to_string());
@@ -280,7 +298,7 @@ mod tests {
     #[test]
     fn init_argv_carries_the_network_plan_when_there_is_one() {
         let mut spec = spec();
-        spec.network = Some(veth::Plan::new(7));
+        spec.network = Some(Connectivity::Bridge(veth::Plan::new(7)));
         let argv = init_argv(&spec);
 
         let address = argv.iter().position(|a| a == "--net-address").unwrap();
@@ -405,7 +423,19 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 /// Where the runtime keeps per-container state.
-pub const DEFAULT_STATE_ROOT: &str = "/run/quilt";
+///
+/// `/run` belongs to root, so an unprivileged runtime uses the per-user runtime
+/// directory instead. Deliberately not `XDG_RUNTIME_DIR`: `create`, `start` and
+/// `delete` are three separate processes and the caller does not have to give
+/// them the same environment, so a state root read out of one would be a state
+/// root they could disagree about.
+pub fn default_state_root() -> PathBuf {
+    if crate::idmap::has_host_privilege() {
+        PathBuf::from("/run/quilt")
+    } else {
+        PathBuf::from(format!("/run/user/{}/quilt", crate::idmap::host_uid()))
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -590,8 +620,8 @@ pub fn create(
     )
     .context(|| format!("creating the exec fifo at {}", fifo.display()))?;
 
-    let driver = crate::cgroup::RootCgroup::from_config(id, config.linux.cgroups_path.as_deref())?;
-    let scope = Scope::create(&driver)?;
+    let driver = crate::cgroup::driver_for_this_user(id, config.linux.cgroups_path.as_deref())?;
+    let scope = Scope::create(driver.as_ref())?;
     scope.apply(&Limits::from_oci(config.linux.resources.as_ref())?)?;
     let scope_fd = scope.open()?;
 

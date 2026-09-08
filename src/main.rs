@@ -15,10 +15,10 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::cgroup::{Limits, RootCgroup};
-use crate::container::RunSpec;
+use crate::cgroup::Limits;
+use crate::container::{Connectivity, RunSpec};
 use crate::error::{Context, Error, Result};
-use crate::idmap::Identity;
+use crate::idmap::{Identity, SubUid};
 use crate::init::{InitSpec, OciInit as InitOci};
 use crate::net::NetworkMode;
 use crate::net::veth::{self, Endpoint};
@@ -28,8 +28,10 @@ use crate::ns::Namespaces;
 #[command(name = "quilt", version, about = "a container runtime from scratch")]
 struct Cli {
     /// Where the runtime keeps container state.
-    #[arg(long, global = true, default_value = container::DEFAULT_STATE_ROOT)]
-    root: PathBuf,
+    ///
+    /// Defaults to /run/quilt as root, and /run/user/<uid>/quilt otherwise.
+    #[arg(long, global = true)]
+    root: Option<PathBuf>,
 
     /// Refused. quilt writes cgroup files directly; see SPEC.md's non-goals.
     #[arg(long, global = true)]
@@ -185,6 +187,8 @@ fn main() {
 }
 
 fn dispatch(cli: Cli) -> Result<i32> {
+    let root = cli.root.clone().unwrap_or_else(container::default_state_root);
+
     if cli.systemd_cgroup {
         return Err(Error::msg(
             "--systemd-cgroup asks quilt to have systemd own the container's scope, which it \
@@ -222,7 +226,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 )));
             }
             container::create(
-                &cli.root,
+                &root,
                 &args.id,
                 &args.bundle,
                 args.pid_file.as_deref(),
@@ -232,22 +236,22 @@ fn dispatch(cli: Cli) -> Result<i32> {
         }
 
         Command::Start { id } => {
-            container::start(&cli.root, &id)?;
+            container::start(&root, &id)?;
             Ok(0)
         }
 
         Command::State { id } => {
-            println!("{}", container::print_state(&cli.root, &id)?);
+            println!("{}", container::print_state(&root, &id)?);
             Ok(0)
         }
 
         Command::Kill { id, signal } => {
-            container::kill(&cli.root, &id, &signal)?;
+            container::kill(&root, &id, &signal)?;
             Ok(0)
         }
 
         Command::Delete { id, force } => {
-            container::delete(&cli.root, &id, force)?;
+            container::delete(&root, &id, force)?;
             Ok(0)
         }
 
@@ -288,7 +292,15 @@ fn run(args: RunArgs) -> Result<i32> {
     // time, which is all the address and interface name need.
     let network = match args.net {
         NetworkMode::None => None,
-        NetworkMode::Bridge => Some(veth::Plan::new(std::process::id())),
+        NetworkMode::Bridge if !idmap::has_host_privilege() => {
+            return Err(Error::msg(
+                "--net bridge needs CAP_NET_ADMIN on the host to make a veth and a NAT rule: \
+                 --net pasta does the same job from user space"
+                    .to_string(),
+            ));
+        }
+        NetworkMode::Bridge => Some(Connectivity::Bridge(veth::Plan::new(std::process::id()))),
+        NetworkMode::Pasta => Some(Connectivity::Pasta),
     };
 
     let spec = RunSpec {
@@ -301,8 +313,16 @@ fn run(args: RunArgs) -> Result<i32> {
     };
 
     // One scope per invocation. Phase 4 takes the id from the OCI caller.
-    let driver = RootCgroup::new(cgroup::run_id());
-    container::run(&spec, &Identity, &driver, Namespaces::DEFAULT)
+    let id = cgroup::run_id();
+    let driver = cgroup::driver_for_this_user(&id, None)?;
+
+    // The two seams pick their implementation from the same fact: whether this
+    // process has privilege over the host or only over a namespace.
+    if idmap::has_host_privilege() {
+        container::run(&spec, &Identity, driver.as_ref(), Namespaces::DEFAULT)
+    } else {
+        container::run(&spec, &SubUid::for_current_user()?, driver.as_ref(), Namespaces::DEFAULT)
+    }
 }
 
 /// `SRC` mounts at the same path inside; `SRC:DST` mounts at `DST`. The pair is

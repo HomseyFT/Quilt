@@ -14,6 +14,11 @@ pub enum NetworkMode {
     /// An empty network namespace with nothing but loopback.
     #[default]
     None,
-    /// A veth pair onto a host bridge, with NAT for egress.
+    /// A veth pair onto a host bridge, with NAT for egress. Needs privilege.
     Bridge,
+    /// A user-space network stack joined to the container's namespace, which is
+    /// how an unprivileged container gets out.
+    Pasta,
 }
+
+pub mod pasta;

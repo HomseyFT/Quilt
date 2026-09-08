@@ -3,9 +3,9 @@
 A Linux container runtime in Rust. See [SPEC.md](SPEC.md) for what it is and
 where it is going.
 
-Phases 1 to 5 are done: namespaces, mount setup, `pivot_root`, cgroup v2 limits,
-hand-assembled rtnetlink for veth networking, the OCI runtime interface, and a
-hand-assembled classic-BPF seccomp filter.
+All six phases are done: namespaces, mount setup, `pivot_root`, cgroup v2
+limits, hand-assembled rtnetlink for veth networking, the OCI runtime interface,
+a hand-assembled classic-BPF seccomp filter, and rootless operation.
 
 ## Build
 
@@ -48,9 +48,13 @@ The veth pair is the only part torn down per container.
 ## As an OCI runtime
 
 ```sh
-sudo podman --cgroup-manager=cgroupfs --runtime $(pwd)/target/release/quilt run --rm \
+podman --cgroup-manager=cgroupfs --runtime $(pwd)/target/release/quilt run --rm \
     --security-opt label=disable alpine ls /
 ```
+
+No `sudo`: rootless works, and the container is root inside while the process is
+yours outside. As root the same command runs through the privileged half of each
+seam instead.
 
 Two flags more than you would like. Each is the alternative to silently ignoring
 a security field in the bundle, which quilt refuses to do; both are non-goals,
@@ -70,8 +74,9 @@ quilt [--root DIR] kill <ID> [SIGNAL]
 ## Test
 
 ```sh
-cargo test              # unit tests; no root, safe to run on every save
-scripts/root-tests.sh   # phase 1 acceptance; builds as you, runs as root
+cargo test                  # unit tests; no root, safe to run on every save
+scripts/rootless-tests.sh   # the unprivileged path; must not be run as root
+scripts/root-tests.sh       # the privileged path; builds as you, runs as root
 ```
 
 `scripts/root-tests.sh` will ask for your sudo password.

@@ -82,7 +82,9 @@ pub struct User {
     pub umask: Option<u32>,
     #[serde(default)]
     pub additional_gids: Vec<u32>,
+    /// Informational: the uid and gid above are what the runtime acts on.
     #[serde(default)]
+    #[allow(dead_code)]
     pub username: Option<String>,
 }
 
@@ -203,7 +205,10 @@ pub struct SyscallRule {
 pub struct SyscallArg {
     pub index: u32,
     pub value: u64,
+    /// Only meaningful for the masked and range comparisons, which the filter
+    /// builder refuses before this is ever looked at.
     #[serde(default)]
+    #[allow(dead_code)]
     pub value_two: Option<u64>,
     pub op: String,
 }
@@ -231,8 +236,12 @@ pub enum NamespaceKind {
     Time,
 }
 
+/// Only ever appears where quilt refuses the bundle outright, so nothing reads
+/// the rows; they exist so that such a bundle parses far enough to be refused
+/// with a useful message.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[allow(dead_code)]
 pub struct IdMapping {
     pub container_id: u32,
     pub host_id: u32,
@@ -257,9 +266,25 @@ pub struct Resources {
     #[serde(default)]
     pub rdma: Option<serde_json::Value>,
     #[serde(default)]
-    pub devices: Vec<serde_json::Value>,
+    pub devices: Vec<DeviceRule>,
     #[serde(default)]
     pub unified: BTreeMap<String, String>,
+}
+
+/// One row of the cgroup device allowlist.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[allow(dead_code)]
+pub struct DeviceRule {
+    pub allow: bool,
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub major: Option<i64>,
+    #[serde(default)]
+    pub minor: Option<i64>,
+    #[serde(default)]
+    pub access: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -314,6 +339,66 @@ pub struct Pids {
     pub limit: i64,
 }
 
+impl Resources {
+    /// The first resource control that is set and that quilt does not write.
+    ///
+    /// Some of these are only performance, but `devices` is the cgroup device
+    /// allowlist and `unified` writes arbitrary cgroup files, so the set has to
+    /// be refused as a whole rather than sorted into important and not.
+    fn unsupported(&self) -> Option<&'static str> {
+        let listed = [
+            ("linux.resources.blockIO", self.block_io.is_some()),
+            ("linux.resources.hugepageLimits", !self.hugepage_limits.is_empty()),
+            ("linux.resources.network", self.network.is_some()),
+            ("linux.resources.rdma", self.rdma.is_some()),
+            // Not simply "is it set". Every podman bundle carries a single
+            // blanket deny and leaves the runtime to permit the nodes it then
+            // creates. quilt reaches that same end by construction: the
+            // container's /dev holds exactly the nodes the runtime put there
+            // and nothing else, so a list that permits nothing is a list quilt
+            // already satisfies. A rule that *allows* a device is one it would
+            // have to enforce, and cannot — cgroup v2 does that with an eBPF
+            // program attached to the scope.
+            ("linux.resources.devices", self.devices.iter().any(|rule| rule.allow)),
+            ("linux.resources.unified", !self.unified.is_empty()),
+        ];
+        if let Some((field, _)) = listed.iter().find(|(_, present)| *present) {
+            return Some(field);
+        }
+
+        if let Some(memory) = &self.memory {
+            let listed = [
+                ("memory.reservation", memory.reservation.is_some()),
+                ("memory.kernel", memory.kernel.is_some()),
+                ("memory.kernelTCP", memory.kernel_tcp.is_some()),
+                ("memory.swappiness", memory.swappiness.is_some()),
+                ("memory.disableOOMKiller", memory.disable_oom_killer.is_some()),
+                ("memory.useHierarchy", memory.use_hierarchy.is_some()),
+                ("memory.checkBeforeUpdate", memory.check_before_update.is_some()),
+            ];
+            if let Some((field, _)) = listed.iter().find(|(_, present)| *present) {
+                return Some(field);
+            }
+        }
+
+        if let Some(cpu) = &self.cpu {
+            let listed = [
+                ("cpu.shares", cpu.shares.is_some()),
+                ("cpu.burst", cpu.burst.is_some()),
+                ("cpu.realtimeRuntime", cpu.realtime_runtime.is_some()),
+                ("cpu.realtimePeriod", cpu.realtime_period.is_some()),
+                ("cpu.cpus", cpu.cpus.is_some()),
+                ("cpu.mems", cpu.mems.is_some()),
+                ("cpu.idle", cpu.idle.is_some()),
+            ];
+            if let Some((field, _)) = listed.iter().find(|(_, present)| *present) {
+                return Some(field);
+            }
+        }
+        None
+    }
+}
+
 fn root_dir() -> PathBuf {
     PathBuf::from("/")
 }
@@ -365,6 +450,42 @@ impl Config {
                     .to_string(),
             ));
         }
+        // Named so the bundle parses, and refused so it is not quietly dropped.
+        // `deny_unknown_fields` guarantees quilt has *seen* every field; these
+        // are the ones it has seen and cannot carry out.
+        for (field, present) in [
+            ("process.oomScoreAdj", self.process.oom_score_adj.is_some()),
+            ("process.scheduler", self.process.scheduler.is_some()),
+            ("process.ioPriority", self.process.io_priority.is_some()),
+            ("process.execCPUAffinity", self.process.exec_cpu_affinity.is_some()),
+            ("process.consoleSize", self.process.console_size.is_some()),
+            ("linux.personality", self.linux.personality.is_some()),
+            ("linux.intelRdt", self.linux.intel_rdt.is_some()),
+            ("linux.timeOffsets", self.linux.time_offsets.is_some()),
+            ("linux.rootfsPropagation", self.linux.rootfs_propagation.is_some()),
+        ] {
+            if present {
+                return Err(Error::msg(format!(
+                    "config.json sets {field}, which quilt does not apply"
+                )));
+            }
+        }
+
+        // Per-mount id mappings are idmapped mounts, which need CAP_SYS_ADMIN in
+        // the namespace owning the filesystem's superblock — see the phase 6
+        // notes in SPEC.md for why that is not something quilt can arrange.
+        if self.mounts.iter().any(|m| !m.uid_mappings.is_empty() || !m.gid_mappings.is_empty()) {
+            return Err(Error::msg(
+                "config.json asks for an idmapped mount, which quilt does not create".to_string(),
+            ));
+        }
+
+        if let Some(field) = self.linux.resources.as_ref().and_then(Resources::unsupported) {
+            return Err(Error::msg(format!(
+                "config.json sets {field}, which quilt does not write to the cgroup"
+            )));
+        }
+
         if self.process.terminal {
             return Err(Error::msg(
                 "config.json asks for a terminal, which needs a console socket quilt does not \
@@ -387,14 +508,6 @@ impl Config {
         Ok(())
     }
 
-    /// The namespaces to create, and the ones to join by path.
-    pub fn namespace_paths(&self) -> Vec<(NamespaceKind, &std::path::Path)> {
-        self.linux
-            .namespaces
-            .iter()
-            .filter_map(|ns| ns.path.as_deref().map(|path| (ns.kind, path)))
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -453,6 +566,72 @@ mod tests {
     }
 
     #[test]
+    fn a_field_quilt_cannot_apply_is_refused_rather_than_dropped() {
+        let json = r#"{
+            "ociVersion": "1.2.1",
+            "process": {"args": ["true"], "oomScoreAdj": -500},
+            "root": {"path": "/rootfs"}
+        }"#;
+        let error = Config::parse(json).unwrap().validate().unwrap_err().to_string();
+        assert!(error.contains("oomScoreAdj"), "{error}");
+    }
+
+    #[test]
+    fn a_resource_control_quilt_does_not_write_is_refused() {
+        let json = r#"{
+            "ociVersion": "1.2.1",
+            "process": {"args": ["true"]},
+            "root": {"path": "/rootfs"},
+            "linux": {"resources": {"cpu": {"cpus": "0-3"}}}
+        }"#;
+        let error = Config::parse(json).unwrap().validate().unwrap_err().to_string();
+        assert!(error.contains("cpu.cpus"), "{error}");
+    }
+
+    #[test]
+    fn a_device_list_that_permits_nothing_is_the_one_podman_sends() {
+        // A blanket deny asks for no access quilt grants, so accepting it does
+        // not weaken anything.
+        let json = r#"{
+            "ociVersion": "1.2.1",
+            "process": {"args": ["true"]},
+            "root": {"path": "/rootfs"},
+            "linux": {"resources": {"devices": [{"allow": false, "access": "rwm"}]}}
+        }"#;
+        Config::parse(json).unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn a_device_rule_that_permits_something_is_refused() {
+        // This one quilt would have to enforce, and cgroup v2 enforces it with
+        // an eBPF program attached to the scope.
+        let json = r#"{
+            "ociVersion": "1.2.1",
+            "process": {"args": ["true"]},
+            "root": {"path": "/rootfs"},
+            "linux": {"resources": {"devices": [
+                {"allow": false, "access": "rwm"},
+                {"allow": true, "type": "b", "major": 8, "minor": 0, "access": "rw"}
+            ]}}
+        }"#;
+        let error = Config::parse(json).unwrap().validate().unwrap_err().to_string();
+        assert!(error.contains("resources.devices"), "{error}");
+    }
+
+    #[test]
+    fn the_resource_controls_quilt_does_write_are_accepted() {
+        let json = r#"{
+            "ociVersion": "1.2.1",
+            "process": {"args": ["true"]},
+            "root": {"path": "/rootfs"},
+            "linux": {"resources": {"pids": {"limit": 2048},
+                                    "memory": {"limit": 1024},
+                                    "cpu": {"quota": 50000, "period": 100000}}}
+        }"#;
+        Config::parse(json).unwrap().validate().unwrap();
+    }
+
+    #[test]
     fn a_bundle_with_the_security_options_off_is_accepted() {
         let config = Config::parse(&fixture("podman-unconfined.json")).unwrap();
         config.validate().unwrap();
@@ -461,10 +640,15 @@ mod tests {
     #[test]
     fn a_network_namespace_given_by_path_is_one_to_join() {
         let config = Config::parse(&fixture("podman-unconfined.json")).unwrap();
-        let paths = config.namespace_paths();
+        let by_path: Vec<NamespaceKind> = config
+            .linux
+            .namespaces
+            .iter()
+            .filter(|ns| ns.path.is_some())
+            .map(|ns| ns.kind)
+            .collect();
 
-        assert_eq!(paths.len(), 1, "podman pre-creates only the netns: {paths:?}");
-        assert_eq!(paths[0].0, NamespaceKind::Network);
+        assert_eq!(by_path, [NamespaceKind::Network], "podman pre-creates only the netns");
     }
 
     #[test]

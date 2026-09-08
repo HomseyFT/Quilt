@@ -41,8 +41,8 @@ pub trait CgroupDriver {
 
 /// Scopes under the unified hierarchy. Requires root.
 pub struct RootCgroup {
-    /// Where the scope sits relative to `/sys/fs/cgroup`.
-    relative: PathBuf,
+    /// Where the scope sits relative to the cgroup root.
+    pub(crate) relative: PathBuf,
 }
 
 impl RootCgroup {
@@ -75,37 +75,99 @@ impl RootCgroup {
 
 impl CgroupDriver for RootCgroup {
     fn scope(&self) -> Result<PathBuf> {
-        let root = Path::new(CGROUP_ROOT);
+        make_scope(Path::new(CGROUP_ROOT), &self.relative)
+    }
+}
 
-        // Every directory between the root and the leaf has to exist and has to
-        // have the controllers enabled for its children, or the leaf's limit
-        // files never appear. The failure is an ENOENT on a write, which says
-        // nothing about which ancestor was the problem.
-        let components: Vec<_> = self.relative.iter().collect();
-        let (leaf, ancestors) = components.split_last().expect("from_config rejects an empty path");
+/// Scopes under the subtree systemd delegates to the user's session, for a
+/// runtime with no write access to the cgroup root.
+pub struct Delegated {
+    base: PathBuf,
+    relative: PathBuf,
+}
 
-        let mut dir = root.to_path_buf();
+impl Delegated {
+    pub fn from_config(id: &str, cgroups_path: Option<&str>) -> Result<Self> {
+        let own = std::fs::read_to_string("/proc/self/cgroup")
+            .context(|| "reading /proc/self/cgroup".to_string())?;
+        let uid = crate::idmap::host_uid();
+
+        let base = delegated_root(&own, uid).ok_or_else(|| {
+            Error::msg(format!(
+                "this process is not inside a user@{uid}.service scope, so systemd has \
+                 delegated no cgroup subtree to write in"
+            ))
+        })?;
+
+        Ok(Self { base, relative: RootCgroup::from_config(id, cgroups_path)?.relative })
+    }
+}
+
+impl CgroupDriver for Delegated {
+    fn scope(&self) -> Result<PathBuf> {
+        make_scope(&self.base, &self.relative)
+    }
+}
+
+/// The point in this process's own cgroup path where systemd stops owning it.
+///
+/// Read rather than constructed: `user@<uid>.service` is where systemd hands
+/// the subtree over, and taking it from `/proc/self/cgroup` means the layout
+/// above it can be whatever this machine's systemd decided.
+fn delegated_root(own_cgroup: &str, uid: u32) -> Option<PathBuf> {
+    // A cgroup v2 line is `0::<path>`; there is only ever one.
+    let path = own_cgroup.lines().find_map(|line| line.strip_prefix("0::"))?;
+    let boundary = format!("user@{uid}.service");
+
+    let mut base = PathBuf::from(CGROUP_ROOT);
+    for component in path.trim().split('/').filter(|c| !c.is_empty()) {
+        base.push(component);
+        if component == boundary {
+            return Some(base);
+        }
+    }
+    None
+}
+
+/// Creates the leaf, and everything between `base` and it.
+///
+/// Every directory on the way has to have the controllers enabled for its
+/// children, or the leaf's limit files never appear. That failure is an ENOENT
+/// on a write much later, which says nothing about which ancestor caused it.
+fn make_scope(base: &Path, relative: &Path) -> Result<PathBuf> {
+    let components: Vec<_> = relative.iter().collect();
+    let (leaf, ancestors) = components.split_last().expect("from_config rejects an empty path");
+
+    let mut dir = base.to_path_buf();
+    enable_controllers(&dir)?;
+    for ancestor in ancestors {
+        dir = dir.join(ancestor);
+        std::fs::create_dir_all(&dir).context(|| format!("creating {}", dir.display()))?;
         enable_controllers(&dir)?;
-        for ancestor in ancestors {
-            dir = dir.join(ancestor);
-            std::fs::create_dir_all(&dir).context(|| format!("creating {}", dir.display()))?;
-            enable_controllers(&dir)?;
-        }
+    }
 
-        // Deliberately not create_dir_all: a directory that is already there is
-        // a scope some earlier run left behind, and its limit files are not
-        // this container's. Reusing it would silently apply them, because
-        // `Limits::files` only writes the limits that were actually asked for.
-        let scope = dir.join(leaf);
-        match std::fs::create_dir(&scope) {
-            Ok(()) => Ok(scope),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(Error::msg(format!(
-                "{} already exists; refusing to reuse a scope whose limits are not this \
-                 container's",
-                scope.display()
-            ))),
-            Err(e) => Err(e).context(|| format!("creating {}", scope.display())),
-        }
+    // Deliberately not create_dir_all: a directory that is already there is a
+    // scope some earlier run left behind, and its limit files are not this
+    // container's. Reusing it would silently apply them, because `Limits::files`
+    // only writes the limits that were actually asked for.
+    let scope = dir.join(leaf);
+    match std::fs::create_dir(&scope) {
+        Ok(()) => Ok(scope),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(Error::msg(format!(
+            "{} already exists; refusing to reuse a scope whose limits are not this container's",
+            scope.display()
+        ))),
+        Err(e) => Err(e).context(|| format!("creating {}", scope.display())),
+    }
+}
+
+/// The driver for whoever is running: root writes under the cgroup root, and
+/// anyone else writes in the subtree systemd delegated to their session.
+pub fn driver_for_this_user(id: &str, cgroups_path: Option<&str>) -> Result<Box<dyn CgroupDriver>> {
+    if crate::idmap::has_host_privilege() {
+        Ok(Box::new(RootCgroup::from_config(id, cgroups_path)?))
+    } else {
+        Ok(Box::new(Delegated::from_config(id, cgroups_path)?))
     }
 }
 
@@ -501,6 +563,31 @@ mod tests {
         let driver =
             RootCgroup::from_config("abc123", Some("/libpod_parent/libpod-abc123")).unwrap();
         assert_eq!(driver.relative, PathBuf::from("libpod_parent/libpod-abc123"));
+    }
+
+    #[test]
+    fn the_delegated_root_stops_where_systemd_hands_over() {
+        let own = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/kitty.scope\n";
+        assert_eq!(
+            delegated_root(own, 1000).unwrap(),
+            PathBuf::from(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service"
+            )
+        );
+    }
+
+    #[test]
+    fn a_process_outside_a_user_service_has_nothing_delegated_to_it() {
+        // A system service, or a session that systemd is not managing. Saying
+        // so beats writing into a subtree that belongs to something else.
+        assert_eq!(delegated_root("0::/system.slice/sshd.service\n", 1000), None);
+        assert_eq!(delegated_root("", 1000), None);
+    }
+
+    #[test]
+    fn the_boundary_is_this_users_service_and_not_another() {
+        let own = "0::/user.slice/user-1001.slice/user@1001.service/app.slice\n";
+        assert_eq!(delegated_root(own, 1000), None);
     }
 
     #[test]

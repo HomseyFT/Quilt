@@ -375,14 +375,14 @@ fn apply_user(user: &crate::spec::User) -> Result<()> {
     let groups: Vec<rustix::process::Gid> = user
         .additional_gids
         .iter()
-        .map(|gid| unsafe { rustix::process::Gid::from_raw(*gid) })
+        .map(|gid| rustix::process::Gid::from_raw(*gid))
         .collect();
     rustix::thread::set_thread_groups(&groups).context(|| "setting supplementary groups".to_string())?;
 
-    // SAFETY: the ids come from the bundle; the kernel checks whether this
-    // process is allowed to assume them.
-    let gid = unsafe { rustix::process::Gid::from_raw(user.gid) };
-    let uid = unsafe { rustix::process::Uid::from_raw(user.uid) };
+    // The ids come from the bundle; the kernel decides whether this process is
+    // allowed to assume them.
+    let gid = rustix::process::Gid::from_raw(user.gid);
+    let uid = rustix::process::Uid::from_raw(user.uid);
     rustix::thread::set_thread_res_gid(gid, gid, gid).context(|| "setting the group id".to_string())?;
     rustix::thread::set_thread_res_uid(uid, uid, uid).context(|| "setting the user id".to_string())
 }

@@ -695,6 +695,22 @@ pub fn compile(profile: &crate::spec::Seccomp) -> Result<Vec<Instruction>> {
             profile.architectures
         )));
     }
+    if !profile.flags.is_empty() {
+        // SECCOMP_FILTER_FLAG_* changes how the filter is loaded. quilt sets
+        // one of them itself, behind --seccomp-log; honouring a bundle's list
+        // would mean deciding what each does, and dropping it silently would
+        // mean loading a filter that behaves differently from the one asked for.
+        return Err(Error::msg(format!(
+            "config.json sets the seccomp flags {:?}, which quilt does not pass on",
+            profile.flags
+        )));
+    }
+    if profile.listener_metadata.is_some() {
+        return Err(Error::msg(
+            "config.json sets seccomp listener metadata, which goes with a listener quilt does              not connect to"
+                .to_string(),
+        ));
+    }
     if let Some(path) = &profile.listener_path {
         return Err(Error::msg(format!(
             "config.json points seccomp at the listener {path}, which quilt does not connect to"
@@ -1136,6 +1152,16 @@ mod tests {
         assert!(action_for("SCMP_ACT_INVENTED", None).is_err());
         assert!(compare_for("SCMP_CMP_MASKED_EQ").is_err());
         assert!(compare_for("SCMP_CMP_LT").is_err());
+    }
+
+    #[test]
+    fn seccomp_load_flags_are_refused_rather_than_dropped() {
+        let error = compile(&profile(
+            r#"{"defaultAction": "SCMP_ACT_ALLOW", "flags": ["SECCOMP_FILTER_FLAG_TSYNC"]}"#,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("SECCOMP_FILTER_FLAG_TSYNC"), "{error}");
     }
 
     #[test]

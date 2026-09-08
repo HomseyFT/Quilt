@@ -367,15 +367,40 @@ that matter and byte comparison would not:
 Plain `podman --runtime quilt`, no sudo anywhere.
 
 - `SubUid` mapper via `newuidmap` / `newgidmap`
-- `Delegated` cgroup driver under `user@1000.service`
-- Idmapped mounts (`MOUNT_ATTR_IDMAP` via `mount_setattr`, kernel 6.19 has it)
-  so image files owned by uid 0 are usable without a chown pass. The
-  `mount_setattr` wrapper and its `struct mount_attr` already exist from
-  phase 1, with `userns_fd` waiting to be filled in
-- Connectivity via `pasta`, which is already installed
+- `Delegated` cgroup driver under `user@1000.service`, found by reading this
+  process's own cgroup rather than by constructing the path: `user@<uid>.service`
+  is where systemd hands the subtree over, and everything above it is not ours
+- Connectivity via `pasta`. It has to be told to join the *user* namespace as
+  well as the network one — the netns is owned by the userns the clone made, and
+  joining a netns needs CAP_SYS_ADMIN in its owner. It also needs
+  `--no-netns-quit`: that watch is for a namespace bound into `/run/netns`, and
+  the container's is a live process's namespace instead
+- **Not** idmapped mounts. `MOUNT_ATTR_IDMAP` needs CAP_SYS_ADMIN in the user
+  namespace that owns the filesystem's superblock, so an unprivileged process
+  cannot idmap a host filesystem: the call returns EPERM, and idmapping a tmpfs
+  made inside the namespace with that same namespace returns EINVAL. Both were
+  measured rather than assumed.
+
+  The outcome the bullet wanted arrives anyway, from the mapping instead of the
+  mount. `SubUid` maps container uid 0 to the invoking user, so a rootfs
+  unpacked by that user is already owned by root inside, with no chown pass. A
+  bundle that asks for a per-mount id mapping is refused rather than ignored.
+
+Telling privilege apart is its own problem, and getting it wrong is silent.
+`geteuid()` returns 0 inside a user namespace, so a rootless runtime believes it
+is root while every write lands as the real user; and the identity id-map is not
+enough either, because an ordinary user's shell has one. Privilege over the host
+is both together. The id a rootless runtime needs for `/run/user/<uid>` and
+`user@<uid>.service` is its id *outside* the namespace, which comes from
+translating uid 0 back out through `/proc/self/uid_map`.
 
 **Accepts when:** the phase-4 podman demo runs as your normal user, and
 `ps -o user` shows `nathan` outside while `id` inside shows uid 0.
+
+These run as an ordinary user by construction, so they are their own tier —
+`scripts/rootless-tests.sh`, which refuses to run under sudo. Running them as
+root would exercise the privileged half of every seam and prove nothing about
+this phase.
 
 ## Testing
 
@@ -400,6 +425,10 @@ reference implementation:
 
 This is the tier that catches a filter that is subtly wrong but still loads —
 the failure mode that manual testing never finds.
+
+**Rootless integration.** Gated behind `QUILT_TEST_ROOTLESS=1`, and refuses to
+run as root. Every seam picks its second implementation precisely because the
+caller is unprivileged, so this is the only tier that exercises those halves.
 
 **Root integration.** Gated behind `QUILT_TEST_ROOT=1` so a plain `cargo test`
 stays safe. Asserts on observable behaviour: PID 1 inside, OOM kill fires, mount
