@@ -1,7 +1,6 @@
 # quilt
 
-A Linux container runtime in Rust. See [SPEC.md](SPEC.md) for what it is and
-where it is going.
+A Linux container runtime in Rust.
 
 All six phases are done: namespaces, mount setup, `pivot_root`, cgroup v2
 limits, hand-assembled rtnetlink for veth networking, the OCI runtime interface,
